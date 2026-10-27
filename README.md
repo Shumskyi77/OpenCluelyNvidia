@@ -99,6 +99,81 @@ If you would rather build from source, three steps are all it takes.
 ./setup.sh --skip-whisper         # Skip the local Whisper bootstrap
 ```
 
+## Установка и запуск (Windows)
+
+### Способ 1: полный установщик (рекомендуется)
+
+1. Скачайте репозиторий:
+   ```bash
+   git clone https://github.com/Shumskyi77/OpenCluelyNvidia.git
+   cd OpenCluelyNvidia
+   ```
+   Или скачайте ZIP-архив с GitHub и распакуйте его.
+
+2. Дважды кликните по файлу **`install-all.bat`**.
+   Скрипт установит Node.js LTS, Python 3.12 и Git (если их нет), обновит PATH, а затем запустит `setup.bat`.
+
+3. При первом запуске откроется окно настроек. Вставьте туда ключ ИИ-провайдера:
+   - **Google Gemini:** https://aistudio.google.com/apikey
+   - **NVIDIA NIM:** https://build.nvidia.com
+
+### Способ 2: только настройка и запуск
+
+Если Node.js 18+ уже установлен, дважды кликните по **`setup.bat`**.
+
+Скрипт:
+1. Создаст `.env` из `env.example` (если `.env` ещё нет).
+2. Установит зависимости (`npm install`).
+3. Запустит приложение (`npm start`).
+
+При первом запуске голосовой движок Whisper установится автоматически через мастер настройки.
+
+### Настройка `.env` и API-ключей
+
+```bash
+# Требуется — выберите одного провайдера
+GEMINI_API_KEY=ваш_ключ_из_google_ai_studio
+# или
+NVIDIA_API_KEY=nvapi-ваш_ключ_из_nvidia
+
+# Опционально — голос (Whisper)
+SPEECH_PROVIDER=whisper
+WHISPER_MODEL=small
+WHISPER_LANGUAGE=en
+```
+
+- Никогда не коммитьте `.env` — он в `.gitignore` и содержит секретные ключи.
+- Если ключ уже есть в `.env`, установщик его не перезапишет.
+
+### Горячие клавиши
+
+| Действие | Сочетание |
+|---|---|
+| Снимок экрана | `Ctrl + Shift + S` |
+| Голос вкл./выкл. | `Alt + R` |
+| Показать/скрыть окна | `Ctrl + Shift + V` |
+| Клик-сквозь | `Ctrl + Shift + I` |
+| Чат | `Ctrl + Shift + C` |
+| Настройки | `Ctrl + ,` |
+
+## Как запушить изменения в GitHub
+
+Если вы вносили правки и хотите отправить их в репозиторий:
+
+```bash
+git add -A
+git commit -m "описание изменений"
+git push origin main
+```
+
+Если репозиторий привязан впервый раз:
+
+```bash
+git remote add origin https://github.com/Shumskyi77/OpenCluelyNvidia.git
+git branch -M main
+git push -u origin main
+```
+
 ## Configuration
 
 The setup script writes sensible defaults. The only required value is a Gemini API key.
