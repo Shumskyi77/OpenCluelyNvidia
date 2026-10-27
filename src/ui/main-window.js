@@ -10,7 +10,7 @@ class MainWindowUI {
     constructor() {
         this.isInteractive = false;
         this.isHidden = false;
-        this.currentSkill = 'dsa'; // Default, will be updated from settings
+        this.currentSkill = 'general'; // Universal assistant (was DSA-only)
         this.statusDot = null;
         this.skillIndicator = null;
         this.micButton = null;
@@ -25,7 +25,7 @@ class MainWindowUI {
         
         // Define available skills for navigation
         this.availableSkills = [
-            'dsa'
+            'general'
         ];
         
         this.init();
@@ -74,7 +74,9 @@ class MainWindowUI {
             if (window.electronAPI && window.electronAPI.getSettings) {
                 const settings = await window.electronAPI.getSettings();
                 if (settings && settings.activeSkill) {
-                    this.currentSkill = settings.activeSkill;
+                    const s = String(settings.activeSkill).toLowerCase().trim();
+                    // Legacy interview-only skills no longer exist — use universal mode
+                    this.currentSkill = (s === 'dsa' || s === 'general') ? s : 'general';
                     logger.debug('Loaded current skill from settings', {
                         component: 'MainWindowUI',
                         skill: this.currentSkill
@@ -288,10 +290,10 @@ class MainWindowUI {
             }
         });
 
-        // Skill indicator click handler toggles DSA skill
+        // Skill indicator click handler — universal assistant (single mode)
         this.skillIndicator.addEventListener('click', () => {
             if (!this.isInteractive) return;
-            const newSkill = 'dsa';
+            const newSkill = 'general';
             if (window.electronAPI && window.electronAPI.updateActiveSkill) {
                 window.electronAPI.updateActiveSkill(newSkill).then(() => {
                     this.handleSkillActivated(newSkill);
@@ -519,6 +521,7 @@ class MainWindowUI {
     handleLLMResponse(data) {
         const skill = data.skill || data.metadata?.skill || 'General';
         const skillNames = {
+            'general': 'General',
             'dsa': 'DSA',
             'behavioral': 'Behavioral', 
             'sales': 'Sales',
@@ -672,30 +675,37 @@ class MainWindowUI {
     }
 
     /**
-     * Capture microphone audio in the renderer using the Web Audio API.
-     * This is used for Whisper on Windows where node-record-lpcm16's sox/rec
-     * dependencies are unavailable.
+     * Capture audio in the renderer using the Web Audio API.
+     * Used for Whisper on Windows/macOS where node-record-lpcm16's sox/rec
+     * dependencies are unavailable (Windows) or undesirable (macOS).
+     *
+     * Captures the microphone and/or the system sound (display-media
+     * loopback, auto-granted by the main process) depending on the
+     * `audioSource` setting ('mic' | 'system' | 'both'). Multiple sources
+     * are connected to the same ScriptProcessor input, which sums them, so
+     * the main process receives one already-mixed PCM stream.
      */
     async _startRendererAudioCapture() {
         try {
             this._stopRendererAudioCapture();
 
-            const stream = await navigator.mediaDevices.getUserMedia({
-                audio: {
-                    echoCancellation: true,
-                    noiseSuppression: true,
-                    autoGainControl: true,
-                    sampleRate: { ideal: 16000 }
+            let audioSource = 'both';
+            try {
+                if (window.electronAPI && window.electronAPI.getSettings) {
+                    const settings = await window.electronAPI.getSettings();
+                    if (settings && settings.audioSource) {
+                        audioSource = settings.audioSource;
+                    }
                 }
-            });
-            this._mediaStream = stream;
+            } catch (_) { /* default to both */ }
+            const wantMic = audioSource !== 'system';
+            const wantSys = audioSource !== 'mic';
 
             const audioContext = new (window.AudioContext || window.webkitAudioContext)({
                 sampleRate: 16000
             });
             this._audioContext = audioContext;
 
-            const source = audioContext.createMediaStreamSource(stream);
             const bufferSize = 4096;
             const scriptNode = audioContext.createScriptProcessor(bufferSize, 1, 1);
             this._scriptNode = scriptNode;
@@ -713,10 +723,94 @@ class MainWindowUI {
                 window.electronAPI.sendAudioChunk(pcm16.buffer);
             };
 
-            source.connect(scriptNode);
+            let connected = 0;
+
+            if (wantMic) {
+                try {
+                    const stream = await navigator.mediaDevices.getUserMedia({
+                        audio: {
+                            echoCancellation: true,
+                            noiseSuppression: true,
+                            autoGainControl: true,
+                            sampleRate: { ideal: 16000 }
+                        }
+                    });
+                    this._mediaStream = stream;
+                    const source = audioContext.createMediaStreamSource(stream);
+                    const gain = audioContext.createGain();
+                    gain.gain.value = 1.0;
+                    source.connect(gain);
+                    gain.connect(scriptNode);
+                    this._micSource = source;
+                    this._micGain = gain;
+                    connected++;
+                } catch (error) {
+                    logger.warn('Microphone unavailable, continuing without it', {
+                        component: 'MainWindowUI',
+                        error: error.message
+                    });
+                }
+            }
+
+            if (wantSys) {
+                try {
+                    // Audio-only loopback: the main process auto-selects the
+                    // screen via setDisplayMediaRequestHandler (no picker).
+                    // Video is requested for compatibility and its tracks are
+                    // stopped immediately — only loopback audio is used.
+                    // Processing (echo cancellation etc.) stays OFF so the
+                    // system sound reaches Whisper unmodified.
+                    const sysStream = await navigator.mediaDevices.getDisplayMedia({
+                        video: { frameRate: { ideal: 1 } },
+                        audio: {
+                            echoCancellation: false,
+                            noiseSuppression: false,
+                            autoGainControl: false
+                        }
+                    });
+                    sysStream.getVideoTracks().forEach((track) => {
+                        try { track.stop(); } catch (_) { /* ignore */ }
+                    });
+                    const sysAudio = sysStream.getAudioTracks();
+                    if (!sysAudio.length) {
+                        throw new Error('loopback audio track missing');
+                    }
+                    this._sysStream = sysStream;
+                    const sysSource = audioContext.createMediaStreamSource(sysStream);
+                    const sysGain = audioContext.createGain();
+                    sysGain.gain.value = 0.9;
+                    sysSource.connect(sysGain);
+                    sysGain.connect(scriptNode);
+                    this._sysSource = sysSource;
+                    this._sysGain = sysGain;
+                    connected++;
+                    // If the user stops sharing mid-session, keep the mic going.
+                    sysAudio[0].addEventListener('ended', () => {
+                        try { this._teardownSysSource(); } catch (_) { /* ignore */ }
+                        logger.info('System audio sharing ended; microphone continues', {
+                            component: 'MainWindowUI'
+                        });
+                    });
+                } catch (error) {
+                    logger.warn('System audio unavailable, continuing with microphone', {
+                        component: 'MainWindowUI',
+                        error: error.message
+                    });
+                }
+            }
+
+            if (!connected) {
+                throw new Error('no audio source available');
+            }
+
             scriptNode.connect(audioContext.destination);
 
-            logger.info('Renderer audio capture started', { component: 'MainWindowUI' });
+            logger.info('Renderer audio capture started', {
+                component: 'MainWindowUI',
+                audioSource,
+                hasMic: !!this._mediaStream,
+                hasSystem: !!this._sysStream
+            });
         } catch (error) {
             logger.error('Failed to start renderer audio capture', {
                 component: 'MainWindowUI',
@@ -729,6 +823,30 @@ class MainWindowUI {
         }
     }
 
+    _teardownSysSource() {
+        try {
+            if (this._sysSource) {
+                this._sysSource.disconnect();
+                this._sysSource = null;
+            }
+            if (this._sysGain) {
+                this._sysGain.disconnect();
+                this._sysGain = null;
+            }
+            if (this._sysStream) {
+                this._sysStream.getTracks().forEach((track) => {
+                    try { track.stop(); } catch (_) { /* ignore */ }
+                });
+                this._sysStream = null;
+            }
+        } catch (error) {
+            logger.error('Error tearing down system audio source', {
+                component: 'MainWindowUI',
+                error: error.message
+            });
+        }
+    }
+
     _stopRendererAudioCapture() {
         try {
             if (this._scriptNode) {
@@ -736,6 +854,15 @@ class MainWindowUI {
                 this._scriptNode.onaudioprocess = null;
                 this._scriptNode = null;
             }
+            if (this._micSource) {
+                try { this._micSource.disconnect(); } catch (_) { /* ignore */ }
+                this._micSource = null;
+            }
+            if (this._micGain) {
+                try { this._micGain.disconnect(); } catch (_) { /* ignore */ }
+                this._micGain = null;
+            }
+            this._teardownSysSource();
             if (this._mediaStream) {
                 this._mediaStream.getTracks().forEach((track) => track.stop());
                 this._mediaStream = null;
@@ -758,6 +885,7 @@ class MainWindowUI {
 
     updateSkillIndicator() {
         const skillNames = {
+            'general': 'General',
             'dsa': 'DSA',
             'behavioral': 'Behavioral', 
             'sales': 'Sales',
@@ -871,6 +999,7 @@ class MainWindowUI {
 
     showSkillChangeNotification(skill, direction) {
         const skillNames = {
+            'general': 'General',
             'dsa': 'DSA',
             'behavioral': 'Behavioral', 
             'sales': 'Sales',

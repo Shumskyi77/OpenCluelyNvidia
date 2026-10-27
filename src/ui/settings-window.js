@@ -13,10 +13,18 @@ document.addEventListener('DOMContentLoaded', () => {
     const whisperModelInput = document.getElementById('whisperModel');
     const whisperLanguageInput = document.getElementById('whisperLanguage');
     const whisperDeviceSelect = document.getElementById('whisperDevice');
+    const whisperEngineSelect = document.getElementById('whisperEngine');
+    const audioSourceSelect = document.getElementById('audioSource');
     const whisperCaptureModeSelect = document.getElementById('whisperCaptureMode');
     const whisperResponseTargetSelect = document.getElementById('whisperResponseTarget');
     const whisperSegmentMsInput = document.getElementById('whisperSegmentMs');
     const geminiKeyInput = document.getElementById('geminiKey');
+    const llmProviderSelect = document.getElementById('llmProvider');
+    const nvidiaKeyInput = document.getElementById('nvidiaKey');
+    const nvidiaBaseUrlInput = document.getElementById('nvidiaBaseUrl');
+    const nvidiaModelInput = document.getElementById('nvidiaModel');
+    const testLlmButton = document.getElementById('testLlmButton');
+    const testLlmStatus = document.getElementById('testLlmStatus');
     const windowGapInput = document.getElementById('windowGap');
     const codingLanguageSelect = document.getElementById('codingLanguage');
     const activeSkillSelect = document.getElementById('activeSkill');
@@ -84,10 +92,16 @@ document.addEventListener('DOMContentLoaded', () => {
         if (whisperModelInput) whisperModelInput.value = settings.whisperModel || '';
         if (whisperLanguageInput) whisperLanguageInput.value = settings.whisperLanguage || '';
         if (whisperDeviceSelect) whisperDeviceSelect.value = settings.whisperDevice || 'auto';
+        if (whisperEngineSelect) whisperEngineSelect.value = settings.whisperEngine || 'auto';
+        if (audioSourceSelect) audioSourceSelect.value = settings.audioSource || 'both';
         if (whisperCaptureModeSelect) whisperCaptureModeSelect.value = settings.whisperCaptureMode || 'vad';
         if (whisperResponseTargetSelect) whisperResponseTargetSelect.value = settings.whisperResponseTarget || 'both';
         if (whisperSegmentMsInput) whisperSegmentMsInput.value = settings.whisperSegmentMs || '';
         if (geminiKeyInput) geminiKeyInput.value = settings.geminiKey || '';
+        if (llmProviderSelect) llmProviderSelect.value = settings.llmProvider || 'nvidia';
+        if (nvidiaKeyInput) nvidiaKeyInput.value = settings.nvidiaKey || '';
+        if (nvidiaBaseUrlInput) nvidiaBaseUrlInput.value = settings.nvidiaBaseUrl || '';
+        if (nvidiaModelInput) nvidiaModelInput.value = settings.nvidiaModel || '';
         if (windowGapInput) windowGapInput.value = settings.windowGap || '';
 
         // Set C++ as default if no coding language is specified
@@ -95,7 +109,11 @@ document.addEventListener('DOMContentLoaded', () => {
             codingLanguageSelect.value = settings.codingLanguage || 'cpp';
         }
 
-        if (settings.activeSkill && activeSkillSelect) activeSkillSelect.value = settings.activeSkill;
+        if (activeSkillSelect) {
+            const s = String(settings.activeSkill || 'general').toLowerCase().trim();
+            // Legacy interview-only skills no longer exist — fall back to universal mode
+            activeSkillSelect.value = (s === 'dsa' || s === 'general') ? s : 'general';
+        }
 
         // Handle icon selection
         const selectedIcon = settings.selectedIcon || settings.appIcon;
@@ -111,6 +129,7 @@ document.addEventListener('DOMContentLoaded', () => {
         }
 
         updateSpeechFieldStates();
+        updateLlmFieldStates();
     };
 
     // Load settings when window opens
@@ -143,10 +162,16 @@ document.addEventListener('DOMContentLoaded', () => {
         if (whisperModelInput) settings.whisperModel = whisperModelInput.value;
         if (whisperLanguageInput) settings.whisperLanguage = whisperLanguageInput.value;
         if (whisperDeviceSelect) settings.whisperDevice = whisperDeviceSelect.value;
+        if (whisperEngineSelect) settings.whisperEngine = whisperEngineSelect.value;
+        if (audioSourceSelect) settings.audioSource = audioSourceSelect.value;
         if (whisperCaptureModeSelect) settings.whisperCaptureMode = whisperCaptureModeSelect.value;
         if (whisperResponseTargetSelect) settings.whisperResponseTarget = whisperResponseTargetSelect.value;
         if (whisperSegmentMsInput) settings.whisperSegmentMs = whisperSegmentMsInput.value;
         if (geminiKeyInput) settings.geminiKey = geminiKeyInput.value;
+        if (llmProviderSelect) settings.llmProvider = llmProviderSelect.value;
+        if (nvidiaKeyInput) settings.nvidiaKey = nvidiaKeyInput.value;
+        if (nvidiaBaseUrlInput) settings.nvidiaBaseUrl = nvidiaBaseUrlInput.value;
+        if (nvidiaModelInput) settings.nvidiaModel = nvidiaModelInput.value;
         if (windowGapInput) settings.windowGap = windowGapInput.value;
         if (codingLanguageSelect) settings.codingLanguage = codingLanguageSelect.value;
         if (activeSkillSelect) settings.activeSkill = activeSkillSelect.value;
@@ -179,8 +204,31 @@ document.addEventListener('DOMContentLoaded', () => {
             if (input) input.disabled = provider !== 'azure';
         });
         [whisperCommandInput, whisperModelInput, whisperLanguageInput, whisperDeviceSelect,
+            whisperEngineSelect,
+            audioSourceSelect,
             whisperCaptureModeSelect, whisperResponseTargetSelect, whisperSegmentMsInput].forEach(input => {
             if (input) input.disabled = provider !== 'whisper';
+        });
+    };
+
+    const updateLlmFieldStates = () => {
+        const provider = llmProviderSelect ? llmProviderSelect.value : 'nvidia';
+
+        const geminiGroup = document.getElementById('geminiFields');
+        const nvidiaGroup = document.getElementById('nvidiaFields');
+
+        if (geminiGroup) {
+            geminiGroup.style.display = provider === 'gemini' ? '' : 'none';
+        }
+        if (nvidiaGroup) {
+            nvidiaGroup.style.display = provider === 'nvidia' ? '' : 'none';
+        }
+
+        [geminiKeyInput].forEach(input => {
+            if (input) input.disabled = provider !== 'gemini';
+        });
+        [nvidiaKeyInput, nvidiaBaseUrlInput, nvidiaModelInput].forEach(input => {
+            if (input) input.disabled = provider !== 'nvidia';
         });
     };
 
@@ -192,10 +240,16 @@ document.addEventListener('DOMContentLoaded', () => {
         whisperModelInput,
         whisperLanguageInput,
         whisperDeviceSelect,
+        whisperEngineSelect,
+        audioSourceSelect,
         whisperCaptureModeSelect,
         whisperResponseTargetSelect,
         whisperSegmentMsInput,
         geminiKeyInput,
+        llmProviderSelect,
+        nvidiaKeyInput,
+        nvidiaBaseUrlInput,
+        nvidiaModelInput,
         windowGapInput
     ];
 
@@ -210,6 +264,33 @@ document.addEventListener('DOMContentLoaded', () => {
         speechProviderSelect.addEventListener('change', () => {
             updateSpeechFieldStates();
             saveSettings();
+        });
+    }
+
+    if (llmProviderSelect) {
+        llmProviderSelect.addEventListener('change', () => {
+            updateLlmFieldStates();
+            saveSettings();
+        });
+    }
+
+    // Test-connection button for the active AI provider
+    if (testLlmButton) {
+        testLlmButton.addEventListener('click', async () => {
+            if (testLlmStatus) testLlmStatus.textContent = 'Testing…';
+            try {
+                saveSettings();
+                // Wait a beat so the main process reinitializes the client first
+                await new Promise(resolve => setTimeout(resolve, 600));
+                const result = await window.electronAPI.testLlmConnection();
+                if (testLlmStatus) {
+                    testLlmStatus.textContent = result && result.success
+                        ? `Connected (${result.model || 'ok'}${result.latency ? `, ${result.latency}ms` : ''})`
+                        : `Failed: ${(result && result.error) || 'unknown error'}`;
+                }
+            } catch (error) {
+                if (testLlmStatus) testLlmStatus.textContent = `Failed: ${error.message}`;
+            }
         });
     }
 
@@ -237,6 +318,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     updateSpeechFieldStates();
+    updateLlmFieldStates();
 
     // Initialize icon grid with correct paths
     const initializeIconGrid = () => {

@@ -2,7 +2,7 @@
 
 # OpenCluely
 
-**The invisible AI interview copilot.**
+**The invisible AI assistant for any question.**
 
 Real-time AI help on a stealth overlay that screen sharing cannot see. Ask by voice or screenshot, and get clear answers that stream in as you need them.
 
@@ -26,7 +26,7 @@ https://github.com/user-attachments/assets/896a7140-1e85-405d-bfbe-e05c9f3a816b
 
 ## What it is
 
-OpenCluely is a desktop app for technical interviews and practice. It places a small overlay on your screen that recording and conferencing tools do not capture. You can speak a question or take a screenshot, and the AI answers in real time. The answer streams into a floating window and an optional chat panel, with clean code blocks and syntax highlighting.
+OpenCluely is a desktop app that answers any question — math, programming, languages, study, work, everyday topics. It places a small overlay on your screen that recording and conferencing tools do not capture. You can speak a question or take a screenshot, and the AI answers in real time: a direct answer first, then a short explanation. The answer streams into a floating window and an optional chat panel, with clean code blocks, syntax highlighting, and beautifully rendered math formulas.
 
 It is free and open source. Processing stays on your machine, and the only thing that leaves your device is the request you send to the AI provider.
 
@@ -34,11 +34,12 @@ It is free and open source. Processing stays on your machine, and the only thing
 
 - **Invisible overlay.** Windows stay out of Zoom, Google Meet, Microsoft Teams, Discord, and OBS captures. You see the answer, the call does not.
 - **Hidden during screen share.** When a share starts, the app can hide every window on its own.
-- **Flexible local voice.** Choose manual start/stop capture or automatic voice-activity detection without fixed-timer sentence cuts.
+- **Flexible local voice.** Microphone, system sound, or both mixed together; faster-whisper engine (2–4× faster CPU) with openai-whisper fallback; manual start/stop capture or automatic voice-activity detection without fixed-timer sentence cuts.
 - **Configurable streamed answers.** Route voice replies to chat, the floating overlay, or both.
 - **Direct image analysis.** Screenshots go straight to Gemini for visual reasoning, with no slow OCR step in between.
 - **Session memory.** The whole conversation is remembered, so follow-ups, edge cases, and optimizations keep their context.
 - **Language aware.** Tailored answers for C++, C, Python, Java, and JavaScript.
+- **Two AI providers.** NVIDIA NIM (default, OpenAI-compatible, custom model) or Google Gemini — switch in Settings, keys stay in local `.env`.
 - **Stealthy by design.** Runs under ordinary system names, ships with no telemetry, and keeps your session local.
 - **Cross platform.** Pre-built installers for Windows and Linux (.deb and AppImage). macOS runs from source in one command.
 
@@ -169,7 +170,7 @@ OpenCluely is under active development. The core is stable and improvements ship
 - AI response window with markdown and syntax highlighting
 - Global shortcuts for capture, visibility, interaction, chat, and settings
 - Session memory and a full chat UI
-- Language picker and a DSA skill prompt
+- Language picker (used when code is requested) and a universal assistant prompt (math rendered with LaTeX)
 - Optional Azure Speech and local Whisper, with an auto hiding mic button
 - Multi-monitor and area capture support
 - Window binding and positioning

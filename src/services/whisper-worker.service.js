@@ -46,6 +46,7 @@ class WhisperWorkerService {
       audio_path: audioPath,
       model: options.model || 'small',
       language: options.language || 'auto',
+      initial_prompt: options.initialPrompt || null,
       model_dir: options.modelDir || null,
       device: options.device || 'auto'
     });
@@ -61,6 +62,7 @@ class WhisperWorkerService {
     return this._request({
       action: 'warmup',
       model: options.model || 'small',
+      engine: options.engine || 'auto',
       model_dir: options.modelDir || null,
       device: options.device || 'auto'
     });

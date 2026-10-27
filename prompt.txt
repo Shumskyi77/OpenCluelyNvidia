@@ -1,0 +1,1151 @@
+# OpenCluely — Complete Windows Installation Agent Prompt
+
+> **How to use:** open OpenCode on the target Windows PC and say *"Execute prompt.txt end to end."*
+> Optionally set `OPENCLUELY_API_KEY` and `OPENCLUELY_PROVIDER` first for an unattended setup; otherwise the agent asks for the key once.
+> By default this installs the latest official release. To build a specific local checkout instead, set `OPENCLUELY_INSTALL_MODE=source` and `OPENCLUELY_SOURCE_DIR` to that folder.
+> The agent should not stop after downloading or installing — the acceptance checklist at the end is the definition of done.
+
+## Mission
+
+You are an autonomous Windows 10/11 installation agent. Your job is to install **OpenCluely** on this PC completely:
+
+1. Download the official Windows build.
+2. Install it for the current user.
+3. Configure the AI provider (NVIDIA NIM or Google Gemini).
+4. Optionally install local Whisper voice input, including Python, the Whisper engine, and the speech model.
+5. Verify that the app actually launches and that the configuration is loaded.
+6. Leave the app running, or leave the onboarding window open if an API key is still missing.
+
+This task is **not** complete when the installer exits. It is complete only when the acceptance checklist at the end passes, or when the only remaining issue is something the user must do (for example, entering an API key or granting microphone permission) and that is clearly documented.
+
+---
+
+## Parameters
+
+Resolve these at the start. Use environment variables when available, otherwise use the defaults below.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `OPENCLUELY_INSTALL_MODE` | `release` | `release` downloads the official installer. `source` builds from GitHub or a local checkout. |
+| `OPENCLUELY_VERSION` | `latest` | Release tag such as `1.8.7`, or `latest`. |
+| `OPENCLUELY_PROVIDER` | `nvidia` | `nvidia` (NVIDIA NIM) or `gemini` (Google Gemini). |
+| `OPENCLUELY_API_KEY` | unset | API key for the selected provider. If unset, ask the user once. |
+| `OPENCLUELY_INSTALL_VOICE` | `yes` | `yes` installs local Whisper. Use `no` on very low-disk machines. |
+| `OPENCLUELY_WHISPER_MODEL` | `small` | `base`, `small`, `medium`, or `large`. `small` is a good balance. |
+| `OPENCLUELY_WHISPER_LANGUAGE` | `en` | ISO-639-1 code of the user's spoken language, e.g. `en`, `pl`, `de`, `es`. |
+| `OPENCLUELY_SOURCE_DIR` | unset | Existing OpenCluely checkout to build in source mode. |
+| `OPENCLUELY_LAUNCH_AFTER_INSTALL` | `yes` | Launch the app at the end. |
+| `OPENCLUELY_FORCE_REINSTALL` | `no` | Reinstall even when the same version is already present. |
+
+### API key handling
+
+At the start of the task, determine whether a usable API key already exists:
+
+- If `OPENCLUELY_API_KEY` is set, use it.
+- Otherwise, look for an existing key in the OpenCluely config (see Phase 3 and Phase 5). If it is present and not a placeholder, keep it.
+- If neither exists, ask the user once for the key for the chosen provider. Tell them where to get one:
+  - NVIDIA NIM: https://build.nvidia.com
+  - Google Gemini: https://aistudio.google.com/apikey
+- If the user declines or does not have a key, continue the installation. Leave the app onboarding window open for them and mark AI as **pending user key** in the final report.
+- Never print a full API key in chat, logs, command lines, screenshots, or the final report. Mask it as `nvapi-****` or `AIza****`.
+
+---
+
+## Non-negotiable rules
+
+- Use **PowerShell 5.1-compatible commands**. Do not use Bash syntax, `&&`, `||`, or Unix-only commands.
+- Run all commands as the logged-in user. Do not try to bypass UAC, SmartScreen, Defender, or organizational policy. If a UAC prompt appears, ask the user to approve it.
+- Do not disable Windows Defender, SmartScreen, firewall, or antivirus.
+- Download only from official sources: `github.com/TechyCSR/OpenCluely`, `nodejs.org`, `python.org`, `git-scm.com`, Microsoft `winget`, or the official provider API.
+- Verify the installer SHA-256 checksum whenever the release publishes one.
+- Preserve an existing `.env`, API keys, voice environment, and model cache. Back up `.env` before changing it.
+- Do not use `npm start` on Windows. The package script uses the Unix `env` command and fails in plain Windows. Use the installed `.exe` or `node_modules\.bin\electron.cmd`.
+- Do not install `sox` or `ffmpeg` for the core app. On Windows, OpenCluely uses the renderer's Web Audio capture and sends WAV audio to Whisper; neither is required for normal use.
+- Long operations (installer download, `pip install`, model download, source build) can take 10–30 minutes. Use a long command timeout. Do not abort because a progress bar appears frozen.
+- If a command fails, try the documented fallback. If the fallback also fails, record the exact error and continue with the parts that still work.
+- Do not claim success without running the verification in Phase 6.
+- Because each shell invocation may be a new process, persist these values in a state file after each phase, or run the whole installation from one temporary PowerShell script:
+
+  `C:\Users\<user>\AppData\Local\Temp\OpenCluely-install\state.json`
+
+  Persist at least: `ReleaseTag`, `InstallerPath`, `InstallDir`, `ExePath`, `ConfigDir`, `EnvPath`, `VoiceInstalled`, `ProviderKeyValid`.
+
+---
+
+## Phase 0 — Preflight
+
+Run the checks below and stop only if the machine cannot possibly run the app.
+
+```powershell
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+$WorkDir = Join-Path $env:TEMP 'OpenCluely-install'
+New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
+
+$cv    = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+$build = [int]$cv.CurrentBuildNumber
+$arch  = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
+$isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+  [Security.Principal.WindowsBuiltInRole]::Administrator
+)
+
+Write-Host "Windows build: $build"
+Write-Host "Architecture:  $arch"
+Write-Host "Elevated:      $isAdmin"
+```
+
+Checks:
+
+- **Windows version:** Windows 10 build 17763 (1809) or newer, or Windows 11. If older, report that the current app does not support it and stop.
+- **Architecture:** `AMD64` or `ARM64` is fully supported. On ARM64, the x64 build runs under emulation. `x86` (32-bit Windows) is an edge case: try the release installer but skip Whisper voice and warn that it is untested.
+- **Disk space:** at least **2 GB free** for the release install. With Whisper, require **8 GB free** (PyTorch and models can use 4–6 GB). If space is below 8 GB and voice is enabled, ask the user whether to skip voice.
+- **Internet:** verify HTTPS access to GitHub and the chosen AI provider.
+- **Windows S Mode:** if `Get-ComputerInfo` reports `WindowsSubscription` / S Mode or Store-only policy, unsigned installers cannot run. Report and stop.
+- **Existing app:** close it before installing or reconfiguring.
+
+```powershell
+# Close any running OpenCluely / stealth "Terminal" process before installation.
+Get-CimInstance Win32_Process -Filter "Name = 'OpenCluely.exe'" -ErrorAction SilentlyContinue |
+  ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+Get-Process -Name 'OpenCluely' -ErrorAction SilentlyContinue |
+  Stop-Process -Force -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 2
+```
+
+Network test:
+
+```powershell
+try {
+  $null = Invoke-RestMethod -Uri 'https://api.github.com/repos/TechyCSR/OpenCluely' `
+    -Headers @{ 'User-Agent' = 'OpenCluely-Windows-Installer' } -TimeoutSec 30
+  Write-Host 'GitHub: reachable'
+} catch {
+  throw "GitHub is not reachable. Connect to the internet and retry. Error: $($_.Exception.Message)"
+}
+```
+
+If `winget` is unavailable, do not fail the whole task. Release mode does not need `winget`; voice mode can use the official Python installer instead.
+
+---
+
+## Phase 1 — Download the official Windows release
+
+If `OPENCLUELY_INSTALL_MODE=source`, skip this phase and go to **Appendix A — Source mode**.
+
+If `OpenCluely.exe` is already installed at the requested version and `OPENCLUELY_FORCE_REINSTALL` is not `yes`, you may skip the download and installation, then continue at Phase 3. Still verify and reconfigure the existing app.
+
+Use the latest GitHub release unless a specific version was requested.
+
+```powershell
+$Repo = 'TechyCSR/OpenCluely'
+$Headers = @{
+  'User-Agent' = 'OpenCluely-Windows-Installer'
+  'Accept'     = 'application/vnd.github+json'
+}
+
+if ($env:OPENCLUELY_VERSION -and $env:OPENCLUELY_VERSION -ne 'latest') {
+  $tag = $env:OPENCLUELY_VERSION
+  if (-not $tag.StartsWith('v')) { $tag = "v$tag" }
+  $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/tags/$tag" -Headers $Headers
+} else {
+  $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" -Headers $Headers
+}
+
+$asset = $release.assets |
+  Where-Object { $_.name -match '^OpenCluely-Setup-.*\.exe$' } |
+  Select-Object -First 1
+
+if (-not $asset) {
+  throw "Release $($release.tag_name) has no Windows Setup .exe asset."
+}
+
+$InstallerPath = Join-Path $WorkDir $asset.name
+Write-Host "Downloading $($asset.name) from $($asset.browser_download_url)"
+
+# curl.exe ships with Windows 10 1803+. Fall back to Invoke-WebRequest if missing.
+$curl = Get-Command curl.exe -ErrorAction SilentlyContinue
+if ($curl) {
+  & curl.exe -L --fail --retry 3 --retry-delay 5 --connect-timeout 30 `
+    -o "$InstallerPath" "$($asset.browser_download_url)"
+  if ($LASTEXITCODE -ne 0) { throw "curl.exe download failed with exit code $LASTEXITCODE" }
+} else {
+  Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $InstallerPath -UseBasicParsing -TimeoutSec 1800
+}
+
+if ((Get-Item $InstallerPath).Length -lt 50MB) {
+  throw "Downloaded installer is unexpectedly small. Download may be incomplete."
+}
+```
+
+### Verify the checksum
+
+Prefer the GitHub asset digest. Fall back to `SHA256SUMS.txt`.
+
+```powershell
+$expected = $null
+if ($asset.digest -and $asset.digest -match '^sha256:([0-9a-fA-F]{64})$') {
+  $expected = $Matches[1].ToLowerInvariant()
+}
+
+if (-not $expected) {
+  $sumsAsset = $release.assets |
+    Where-Object { $_.name -eq 'SHA256SUMS.txt' } |
+    Select-Object -First 1
+  if ($sumsAsset) {
+    $sumsFile = Join-Path $WorkDir 'SHA256SUMS.txt'
+    Invoke-WebRequest -Uri $sumsAsset.browser_download_url -OutFile $sumsFile -UseBasicParsing -TimeoutSec 120
+    $line = Get-Content $sumsFile |
+      Where-Object { $_ -match [regex]::Escape($asset.name) } |
+      Select-Object -First 1
+    if ($line) { $expected = ($line -split '\s+')[0].ToLowerInvariant() }
+  }
+}
+
+if ($expected) {
+  $actual = (Get-FileHash -Algorithm SHA256 -Path $InstallerPath).Hash.ToLowerInvariant()
+  if ($actual -ne $expected) {
+    Remove-Item $InstallerPath -Force
+    throw "SHA-256 mismatch. Expected $expected, got $actual. Do not run the installer."
+  }
+  Write-Host "SHA-256 verified: $actual"
+} else {
+  Write-Warning 'No checksum was published for this asset. Size was validated; continue with caution.'
+}
+
+Unblock-File -Path $InstallerPath
+```
+
+If the GitHub API is rate-limited:
+
+- Wait 60 seconds and retry once.
+- Do not use unofficial mirrors.
+- If download still fails and an existing installation is present, skip to Phase 3 and configure the existing app.
+- Otherwise switch to **Appendix A — Source mode** only if Git/Node can be installed, or report the failure clearly.
+
+---
+
+## Phase 2 — Install OpenCluely
+
+Run the NSIS installer silently for the current user. This avoids requiring administrator rights in the normal case.
+
+```powershell
+$proc = Start-Process -FilePath $InstallerPath `
+  -ArgumentList @('/S', '/currentuser') -PassThru
+
+if (-not $proc.WaitForExit(300000)) {
+  throw 'Installer did not finish within 5 minutes. Check for a UAC or SmartScreen prompt.'
+}
+
+if ($proc.ExitCode -ne 0) {
+  Write-Warning "Silent installer exited with code $($proc.ExitCode). Retrying without /currentuser."
+  $proc2 = Start-Process -FilePath $InstallerPath -ArgumentList @('/S') -PassThru
+  if (-not $proc2.WaitForExit(300000)) { throw 'Installer retry timed out.' }
+  if ($proc2.ExitCode -ne 0) {
+    throw "Installer failed with exit code $($proc2.ExitCode). If a UAC prompt is visible, ask the user to approve it and retry."
+  }
+}
+
+Start-Sleep -Seconds 3
+```
+
+### Locate the installed executable
+
+The default NSIS install location is usually:
+
+`C:\Users\<user>\AppData\Local\Programs\OpenCluely\OpenCluely.exe`
+
+Use the registry first, then fall back to a filesystem search.
+
+```powershell
+$uninstallRoots = @(
+  'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+  'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+  'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+)
+
+$entry = Get-ItemProperty -Path $uninstallRoots -ErrorAction SilentlyContinue |
+  Where-Object { $_.DisplayName -like '*OpenCluely*' } |
+  Select-Object -First 1
+
+$exeCandidates = @()
+
+if ($entry -and $entry.InstallLocation) {
+  $possible = Join-Path $entry.InstallLocation 'OpenCluely.exe'
+  if (Test-Path $possible) { $exeCandidates += (Get-Item $possible) }
+}
+
+$searchRoots = @(
+  (Join-Path $env:LOCALAPPDATA 'Programs'),
+  $env:ProgramFiles,
+  ${env:ProgramFiles(x86)}
+) | Where-Object { $_ -and (Test-Path $_) }
+
+foreach ($root in $searchRoots) {
+  $cluelyDirs = Get-ChildItem $root -Directory -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -match 'Cluely' }
+  foreach ($dir in $cluelyDirs) {
+    $foundExes = Get-ChildItem $dir.FullName -Filter 'OpenCluely.exe' -ErrorAction SilentlyContinue
+    foreach ($foundExe in $foundExes) {
+      $exeCandidates += $foundExe
+    }
+  }
+}
+
+$exeFile = $exeCandidates | Select-Object -First 1
+if (-not $exeFile) {
+  throw 'OpenCluely.exe was not found after installation. The installer may have been blocked or installed elsewhere.'
+}
+
+$ExePath    = $exeFile.FullName
+$InstallDir = $exeFile.DirectoryName
+$InstalledVersion = $exeFile.VersionInfo.ProductVersion
+Write-Host "Installed at: $InstallDir"
+Write-Host "Version:      $InstalledVersion"
+```
+
+### Verify or create shortcuts
+
+The NSIS installer normally creates Start Menu and desktop shortcuts. Verify them; create a desktop shortcut only if missing.
+
+```powershell
+$startMenus = @(
+  (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'),
+  (Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs')
+) | Where-Object { Test-Path $_ }
+
+$startLnk = @(
+  foreach ($menu in $startMenus) {
+    Get-ChildItem $menu -Recurse -Filter '*OpenCluely*.lnk' -ErrorAction SilentlyContinue
+  }
+) | Select-Object -First 1
+
+$desktop = [Environment]::GetFolderPath('Desktop')
+$desktopLnk = Join-Path $desktop 'OpenCluely.lnk'
+if (-not (Test-Path $desktopLnk)) {
+  $ws = New-Object -ComObject WScript.Shell
+  $shortcut = $ws.CreateShortcut($desktopLnk)
+  $shortcut.TargetPath = $ExePath
+  $shortcut.WorkingDirectory = $InstallDir
+  $shortcut.IconLocation = "$ExePath,0"
+  $shortcut.Description = 'OpenCluely'
+  $shortcut.Save()
+  Write-Host "Created desktop shortcut: $desktopLnk"
+}
+```
+
+If no Start Menu shortcut exists, create one under `$startMenu\OpenCluely.lnk` the same way.
+
+If the installer did not run at all because SmartScreen blocked it, do **not** disable SmartScreen. Ask the user to approve “More info → Run anyway” and retry. `Unblock-File` has already removed the Mark-of-the-Web.
+
+---
+
+## Phase 3 — First launch and config-directory discovery
+
+OpenCluely stores its runtime config in Electron's `userData` directory. Depending on the build this is usually one of:
+
+- `%APPDATA%\opencluely`
+- `%APPDATA%\OpenCluely`
+
+On a fresh PC, neither exists until the app starts once. Launch the app, wait for it to create the directory, then close it before writing configuration.
+
+```powershell
+Start-Process -FilePath $ExePath -WorkingDirectory $InstallDir
+
+# Wait up to 30 seconds for the app to create a config folder and .env.
+# Slow disks and antivirus scans can delay the first window.
+$after = @()
+$envFound = @()
+$deadline = (Get-Date).AddSeconds(30)
+do {
+  Start-Sleep -Seconds 2
+  $after = @(
+    Get-ChildItem $env:APPDATA -Directory -ErrorAction SilentlyContinue |
+      Where-Object { $_.Name -match '^opencluely$' }
+  )
+  $envFound = @($after | Where-Object { Test-Path (Join-Path $_.FullName '.env') })
+} while (-not $envFound -and (Get-Date) -lt $deadline)
+
+# Prefer the directory that already contains .env.
+$configObj = $after |
+  Where-Object { Test-Path (Join-Path $_.FullName '.env') } |
+  Sort-Object LastWriteTime -Descending |
+  Select-Object -First 1
+
+if (-not $configObj) {
+  $configObj = $after | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+}
+
+if (-not $configObj) {
+  $fallback = Join-Path $env:APPDATA 'opencluely'
+  New-Item -ItemType Directory -Force -Path $fallback | Out-Null
+  $ConfigDir = $fallback
+  Write-Warning "The app did not create a userData folder; using fallback $ConfigDir"
+} else {
+  $ConfigDir = $configObj.FullName
+}
+
+$EnvPath = Join-Path $ConfigDir '.env'
+Write-Host "Config directory: $ConfigDir"
+Write-Host "Config file:       $EnvPath"
+```
+
+If both `opencluely` and `OpenCluely` exist from older installs, prefer the one with the newest `.env` or `.opencluely-firstrun-completed`. Do not delete the other one; just report it.
+
+Now close the app so `.env` can be written safely:
+
+```powershell
+Get-CimInstance Win32_Process -Filter "Name = 'OpenCluely.exe'" -ErrorAction SilentlyContinue |
+  ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+Get-Process -Name 'OpenCluely' -ErrorAction SilentlyContinue |
+  Stop-Process -Force -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 2
+```
+
+If the app failed to start, inspect:
+
+```powershell
+$logDir = Join-Path $HOME '.OpenCluely\logs'
+Get-ChildItem $logDir -ErrorAction SilentlyContinue |
+  Sort-Object LastWriteTime -Descending |
+  Select-Object -First 5 Name, Length, LastWriteTime
+Get-Content (Get-ChildItem $logDir -Filter 'error-*.log' -ErrorAction SilentlyContinue |
+  Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName -Tail 80
+```
+
+Report the error before continuing. A missing `.env` is not fatal; Phase 5 creates it.
+
+---
+
+## Phase 4 — Optional local Whisper voice setup
+
+Skip this whole phase if `OPENCLUELY_INSTALL_VOICE=no` or the user declined. The app works without voice; the microphone button hides itself.
+
+**Voice is optional.** Wrap the whole of Phase 4 in a `try/catch` so a Python, pip, network, or model-download failure does not abort the main app installation:
+
+```powershell
+$VoiceInstalled = $false
+try {
+  # ... all of Phase 4 below ...
+} catch {
+  Write-Warning "Whisper setup failed; the app will install without voice. Reason: $($_.Exception.Message)"
+  $VoiceInstalled = $false
+}
+```
+
+Only the OpenCluely app itself is mandatory. Continue to Phase 5 after a voice failure and report voice as unavailable.
+
+### 4.1 Find or install Python 3.12
+
+Whisper needs Python 3.9+, and Python 3.12 is the tested choice. Prefer an existing interpreter. Do not use the Microsoft Store `WindowsApps\python.exe` stub.
+
+```powershell
+$pythonExe  = $null
+$pythonArgs = @()
+$pythonVersion = $null
+
+foreach ($candidate in @('py -3.12', 'py -3', 'python', 'python3')) {
+  $parts = $candidate -split '\s+'
+  $name  = $parts[0]
+  $cmdInfo = Get-Command $name -ErrorAction SilentlyContinue
+  if (-not $cmdInfo) { continue }
+  if ($cmdInfo.Source -like '*WindowsApps*') { continue }
+
+  $pyCheckArgs = if ($parts.Count -gt 1) { @($parts[1..($parts.Count - 1)]) } else { @() }
+  $pyCheckArgs += @('-c', 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+
+  $ver = & $name @pyCheckArgs 2>$null
+  if ($LASTEXITCODE -eq 0 -and $ver -match '^3\.(\d+)$') {
+    $minor = [int]$Matches[1]
+    if ($minor -ge 9) {
+      $pythonExe = $name
+      $pythonArgs = if ($parts.Count -gt 1) { @($parts[1..($parts.Count - 1)]) } else { @() }
+      $pythonVersion = $ver
+      break
+    }
+  }
+}
+
+if (-not $pythonExe) {
+  $winget = Get-Command winget -ErrorAction SilentlyContinue
+  if ($winget) {
+    Write-Host 'Installing Python 3.12 with winget (per-user)...'
+    & winget install -e --id Python.Python.3.12 --scope user --silent `
+      --accept-package-agreements --accept-source-agreements --disable-interactivity
+    if ($LASTEXITCODE -ne 0) {
+      Write-Warning 'Per-user winget install failed; retrying without --scope user.'
+      & winget install -e --id Python.Python.3.12 --silent `
+        --accept-package-agreements --accept-source-agreements --disable-interactivity
+    }
+  }
+
+  # Refresh PATH from the registry so new installs are visible in this session.
+  $env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' +
+              [Environment]::GetEnvironmentVariable('Path','User')
+
+  # Retry detection.
+  foreach ($candidate in @('py -3.12', 'py -3', 'python')) {
+    $parts = $candidate -split '\s+'
+    $name  = $parts[0]
+    $cmdInfo = Get-Command $name -ErrorAction SilentlyContinue
+    if (-not $cmdInfo) { continue }
+    if ($cmdInfo.Source -like '*WindowsApps*') { continue }
+    $pyCheckArgs = if ($parts.Count -gt 1) { @($parts[1..($parts.Count - 1)]) } else { @() }
+    $pyCheckArgs += @('-c', 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+    $ver = & $name @pyCheckArgs 2>$null
+    if ($LASTEXITCODE -eq 0 -and $ver -match '^3\.(\d+)$' -and [int]$Matches[1] -ge 9) {
+      $pythonExe = $name
+      $pythonArgs = if ($parts.Count -gt 1) { @($parts[1..($parts.Count - 1)]) } else { @() }
+      $pythonVersion = $ver
+      break
+    }
+  }
+}
+
+if (-not $pythonExe) {
+  Write-Warning 'Python 3.10+ was not found. Downloading the official per-user Python 3.12 installer.'
+  $pyInstaller = Join-Path $WorkDir 'python-3.12-x64.exe'
+  $pyUrl = 'https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe'
+  if (Get-Command curl.exe -ErrorAction SilentlyContinue) {
+    & curl.exe -L --fail --retry 3 -o "$pyInstaller" $pyUrl
+    if ($LASTEXITCODE -ne 0) { throw 'Could not download the Python installer.' }
+  } else {
+    Invoke-WebRequest -Uri $pyUrl -OutFile $pyInstaller -UseBasicParsing -TimeoutSec 600
+  }
+
+  Start-Process -FilePath $pyInstaller -ArgumentList @(
+    '/quiet', 'InstallAllUsers=0', 'PrependPath=1', 'Include_launcher=1',
+    'InstallLauncherAllUsers=0', 'Include_test=0'
+  ) -Wait
+
+  $env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' +
+              [Environment]::GetEnvironmentVariable('Path','User')
+
+  $pythonExe  = 'py'
+  $pythonArgs = @('-3.12')
+}
+
+Write-Host "Using Python $pythonVersion ($pythonExe $($pythonArgs -join ' '))"
+```
+
+If the hard-coded Python 3.12.10 URL returns 404, list `https://www.python.org/ftp/python/` and use the newest `3.12.x` directory. Do not install Python 2.
+
+### 4.2 Create the virtual environment and install Whisper
+
+The app expects its voice environment and models under the same `userData` directory it uses for `.env`.
+
+```powershell
+$Venv       = Join-Path $ConfigDir '.venv-whisper'
+$VenvPython = Join-Path $Venv 'Scripts\python.exe'
+$ModelsDir  = Join-Path $ConfigDir '.whisper-models'
+
+New-Item -ItemType Directory -Force -Path $ModelsDir | Out-Null
+
+if (-not (Test-Path $VenvPython)) {
+  Write-Host "Creating Whisper venv at $Venv"
+  & $pythonExe @pythonArgs -m venv $Venv
+  if ($LASTEXITCODE -ne 0) { throw 'Failed to create the Whisper virtual environment.' }
+}
+
+if (-not (Test-Path $VenvPython)) {
+  throw "Venv python is missing at $VenvPython. Delete $Venv and retry."
+}
+
+& $VenvPython -m pip install --upgrade pip setuptools wheel
+if ($LASTEXITCODE -ne 0) { throw 'pip upgrade failed in the Whisper venv.' }
+
+& $VenvPython -m pip install --upgrade openai-whisper
+if ($LASTEXITCODE -ne 0) {
+  throw 'openai-whisper installation failed. Check disk space, network, and the Python version.'
+}
+
+$FasterInstalled = $true
+& $VenvPython -m pip install --upgrade faster-whisper
+if ($LASTEXITCODE -ne 0) {
+  Write-Warning 'faster-whisper failed to install; continuing with openai-whisper only.'
+  $FasterInstalled = $false
+}
+```
+
+Notes:
+
+- `openai-whisper` pulls PyTorch and is the large part of the install (often 2–3 GB). This is expected.
+- If PyTorch import fails with a missing DLL, install the Microsoft Visual C++ Redistributable:
+  `winget install -e --id Microsoft.VCRedist.2015+.x64 --silent --accept-package-agreements --accept-source-agreements`
+- `faster-whisper` is optional. It is 2–4× faster on CPU. The app falls back to openai-whisper if it is absent.
+
+### 4.3 Pre-download the speech model
+
+```powershell
+$WhisperModel = if ($env:OPENCLUELY_WHISPER_MODEL) { $env:OPENCLUELY_WHISPER_MODEL } else { 'small' }
+
+Write-Host "Downloading OpenAI Whisper model '$WhisperModel'..."
+& $VenvPython -c "import sys, whisper; whisper.load_model(sys.argv[1], download_root=sys.argv[2]); print('openai-model-ok')" `
+  $WhisperModel $ModelsDir
+if ($LASTEXITCODE -ne 0) {
+  Write-Warning 'OpenAI Whisper model download failed. The app will retry on first use.'
+}
+
+$FasterModelReady = $false
+if ($FasterInstalled) {
+  Write-Host "Downloading faster-whisper model '$WhisperModel'..."
+  & $VenvPython -c "import sys; from faster_whisper import WhisperModel; WhisperModel(sys.argv[1], device='cpu', compute_type='int8', download_root=sys.argv[2]); print('faster-model-ok')" `
+    $WhisperModel $ModelsDir
+  if ($LASTEXITCODE -eq 0) {
+    $FasterModelReady = $true
+  } else {
+    Write-Warning 'faster-whisper model download failed. The app will retry on first use.'
+  }
+}
+```
+
+### 4.4 Verify Whisper
+
+```powershell
+& $VenvPython -m whisper --help | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'Whisper CLI is not working in the venv.' }
+
+& $VenvPython -c "import importlib.metadata as m; print('openai-whisper', m.version('openai-whisper'))"
+if ($FasterInstalled) {
+  & $VenvPython -c "import importlib.metadata as m; print('faster-whisper', m.version('faster-whisper'))"
+}
+
+$WhisperCommand = "`"$VenvPython`" -m whisper"
+$VoiceInstalled = $true
+Write-Host "Whisper ready: $WhisperCommand"
+```
+
+If any of this fails, set `$VoiceInstalled = $false`, keep the app installation, and report that voice is unavailable. Do not block the AI assistant from working.
+
+---
+
+## Phase 5 — Write and validate the configuration
+
+The app reads `.env` from the discovered `userData` directory. Merge values; do not replace unrelated user settings.
+
+### 5.1 Back up the existing file
+
+```powershell
+if (Test-Path $EnvPath) {
+  $backup = "$EnvPath.backup-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+  Copy-Item $EnvPath $backup -Force
+  Write-Host "Backed up .env to $backup"
+}
+```
+
+### 5.2 Helper functions
+
+Use UTF-8 **without BOM**. Windows PowerShell's `Set-Content -Encoding UTF8` writes a BOM, which can corrupt the first dotenv key.
+
+```powershell
+function Format-EnvValue([string]$value) {
+  $v = ($value -replace '[\r\n]+', ' ').Trim()
+  if ($v -notmatch '[\s"#]') { return $v }
+  if ($v -notmatch "'") { return "'$v'" }
+  return '"' + ($v -replace '"', '\"') + '"'
+}
+
+function Set-EnvValue([string]$path, [string]$key, [string]$value) {
+  $line = "$key=$(Format-EnvValue $value)"
+  $lines = @()
+  if (Test-Path $path) { $lines = @(Get-Content $path) }
+
+  $found = $false
+  $lines = foreach ($item in $lines) {
+    if ($item -match "^\s*$([regex]::Escape($key))\s*=") {
+      $found = $true
+      $line
+    } else {
+      $item
+    }
+  }
+
+  if (-not $found) { $lines = @($lines) + $line }
+
+  $text = ($lines -join "`r`n") + "`r`n"
+  [System.IO.File]::WriteAllText($path, $text, (New-Object System.Text.UTF8Encoding($false)))
+}
+
+function Get-EnvValue([string]$path, [string]$key) {
+  if (-not (Test-Path $path)) { return $null }
+  $match = Get-Content $path |
+    Where-Object { $_ -match "^\s*$([regex]::Escape($key))\s*=\s*(.*)$" } |
+    Select-Object -First 1
+  if (-not $match) { return $null }
+  $value = ($match -replace "^\s*$([regex]::Escape($key))\s*=\s*", '').Trim()
+  if ($value.StartsWith("'") -and $value.EndsWith("'")) { $value = $value.Substring(1, $value.Length - 2) }
+  elseif ($value.StartsWith('"') -and $value.EndsWith('"')) { $value = $value.Substring(1, $value.Length - 2) }
+  return $value
+}
+```
+
+### 5.3 Resolve provider and key
+
+```powershell
+$Provider = if ($env:OPENCLUELY_PROVIDER) { $env:OPENCLUELY_PROVIDER.ToLowerInvariant() } else { $null }
+
+# If the user did not choose a provider, keep whichever provider already has a key.
+if (-not $Provider) {
+  $nvidiaExisting = Get-EnvValue $EnvPath 'NVIDIA_API_KEY'
+  $geminiExisting = Get-EnvValue $EnvPath 'GEMINI_API_KEY'
+
+  if ($nvidiaExisting -and $nvidiaExisting -notmatch '^your_' -and $nvidiaExisting.Length -gt 10) {
+    $Provider = 'nvidia'
+  } elseif ($geminiExisting -and $geminiExisting -notmatch '^your_' -and $geminiExisting.Length -gt 10) {
+    $Provider = 'gemini'
+  } else {
+    $Provider = 'nvidia'
+  }
+}
+if ($Provider -notin @('nvidia', 'gemini')) { $Provider = 'nvidia' }
+
+$ApiKey = $env:OPENCLUELY_API_KEY
+if (-not $ApiKey) {
+  $existingKey = if ($Provider -eq 'nvidia') {
+    Get-EnvValue $EnvPath 'NVIDIA_API_KEY'
+  } else {
+    Get-EnvValue $EnvPath 'GEMINI_API_KEY'
+  }
+
+  if ($existingKey -and
+      $existingKey -notmatch 'your_.*_api_key_here' -and
+      $existingKey -notmatch '^your_' -and
+      $existingKey.Trim().Length -gt 10) {
+    $ApiKey = $existingKey
+    Write-Host 'Using the existing provider key from .env.'
+  }
+}
+
+if (-not $ApiKey) {
+  Write-Warning 'No API key is available. The app will install but onboarding will remain open.'
+}
+```
+
+If the user supplies a key, validate its shape without printing it:
+
+- NVIDIA keys normally start with `nvapi-`.
+- Gemini keys normally start with `AIza`.
+- A missing or unusual prefix is a warning, not a hard failure.
+
+### 5.4 Write AI provider settings
+
+```powershell
+if ($Provider -eq 'nvidia') {
+  if ($ApiKey) { Set-EnvValue $EnvPath 'NVIDIA_API_KEY' $ApiKey }
+  Set-EnvValue $EnvPath 'LLM_PROVIDER' 'nvidia'
+  Set-EnvValue $EnvPath 'NVIDIA_BASE_URL' $(if ($env:OPENCLUELY_NVIDIA_BASE_URL) { $env:OPENCLUELY_NVIDIA_BASE_URL } else { 'https://integrate.api.nvidia.com/v1' })
+  Set-EnvValue $EnvPath 'NVIDIA_MODEL' $(if ($env:OPENCLUELY_NVIDIA_MODEL) { $env:OPENCLUELY_NVIDIA_MODEL } else { 'google/diffusiongemma-26b-a4b-it' })
+} else {
+  if ($ApiKey) { Set-EnvValue $EnvPath 'GEMINI_API_KEY' $ApiKey }
+  Set-EnvValue $EnvPath 'LLM_PROVIDER' 'gemini'
+}
+```
+
+Do not overwrite an existing key with a placeholder when the user did not provide a new one.
+
+### 5.5 Write voice settings
+
+Only do this when `$VoiceInstalled -eq $true`.
+
+```powershell
+if ($VoiceInstalled) {
+  $Language = if ($env:OPENCLUELY_WHISPER_LANGUAGE) { $env:OPENCLUELY_WHISPER_LANGUAGE } else { 'en' }
+
+  Set-EnvValue $EnvPath 'SPEECH_PROVIDER'        'whisper'
+  Set-EnvValue $EnvPath 'WHISPER_COMMAND'        $WhisperCommand
+  Set-EnvValue $EnvPath 'WHISPER_PYTHON'         $VenvPython
+  Set-EnvValue $EnvPath 'WHISPER_MODEL_DIR'      $ModelsDir
+  Set-EnvValue $EnvPath 'WHISPER_MODEL'          $WhisperModel
+  Set-EnvValue $EnvPath 'WHISPER_LANGUAGE'       $Language
+  Set-EnvValue $EnvPath 'WHISPER_DEVICE'         'auto'
+  Set-EnvValue $EnvPath 'WHISPER_ENGINE'         $(if ($FasterInstalled -and $FasterModelReady) { 'auto' } else { 'openai' })
+  Set-EnvValue $EnvPath 'WHISPER_CAPTURE_MODE'   'vad'
+  Set-EnvValue $EnvPath 'WHISPER_RESPONSE_TARGET' 'both'
+  Set-EnvValue $EnvPath 'AUDIO_SOURCE'           'both'
+  Set-EnvValue $EnvPath 'WHISPER_MANUAL_MAX_MS'  '90000'
+  Set-EnvValue $EnvPath 'WHISPER_GPU_IDLE_MS'    '60000'
+  Set-EnvValue $EnvPath 'WHISPER_SEGMENT_MS'     '4000'
+}
+```
+
+Important details:
+
+- `WHISPER_COMMAND` must be an absolute path to the venv Python plus `-m whisper`, for example:
+  `WHISPER_COMMAND='"C:\Users\Jane Doe\AppData\Roaming\opencluely\.venv-whisper\Scripts\python.exe" -m whisper'`
+- `WHISPER_MODEL_DIR` must be absolute. Relative model paths are ignored by the packaged app. Always write absolute paths for `WHISPER_COMMAND`, `WHISPER_PYTHON`, and `WHISPER_MODEL_DIR`: stealth mode changes Electron's app name at runtime, so relying on userData defaults can make the voice installer and the speech service disagree about where the venv/model live.
+- `WHISPER_PYTHON` should point at the same venv Python as `WHISPER_COMMAND`. It makes the persistent worker use the correct interpreter even if an older app-local venv exists.
+- `WHISPER_LANGUAGE`: use the user's spoken language. The app's internal fallback is Polish (`pl`); for a generic PC set `en` unless the user says otherwise. `auto` is not reliable in this app because it maps to Polish.
+- `SPEECH_PROVIDER=whisper` only when Whisper actually works. Otherwise leave the speech setting alone or omit it; the mic button will hide itself.
+
+### 5.6 Validate the provider key (when provided)
+
+Do not print the key. Treat a failed test as a reportable warning; keep the configured key so the user can fix quota or network issues later.
+
+```powershell
+$ProviderKeyValid = $false
+if ($ApiKey) {
+  try {
+    if ($Provider -eq 'nvidia') {
+      $base = Get-EnvValue $EnvPath 'NVIDIA_BASE_URL'
+      if (-not $base) { $base = 'https://integrate.api.nvidia.com/v1' }
+      $base = $base.TrimEnd('/')
+      $null = Invoke-RestMethod -Uri "$base/models" -Method Get `
+        -Headers @{ Authorization = "Bearer $ApiKey" } -TimeoutSec 30
+      $ProviderKeyValid = $true
+    } else {
+      $null = Invoke-RestMethod -Uri 'https://generativelanguage.googleapis.com/v1beta/models' `
+        -Headers @{ 'x-goog-api-key' = $ApiKey } -Method Get -TimeoutSec 30
+      $ProviderKeyValid = $true
+    }
+    Write-Host 'Provider API key accepted.'
+  } catch {
+    Write-Warning "Provider key validation failed: $($_.Exception.Message)"
+  }
+}
+```
+
+If NVIDIA `/models` returns 404 but the key is valid, retry with a one-token chat completion against the configured model:
+
+```powershell
+$body = @{
+  model = (Get-EnvValue $EnvPath 'NVIDIA_MODEL')
+  messages = @(@{ role = 'user'; content = 'ping' })
+  max_tokens = 1
+  temperature = 0
+} | ConvertTo-Json -Depth 5
+
+$null = Invoke-RestMethod -Uri "$base/chat/completions" -Method Post `
+  -Headers @{ Authorization = "Bearer $ApiKey"; 'Content-Type' = 'application/json' } `
+  -Body $body -TimeoutSec 30
+$ProviderKeyValid = $true
+```
+
+### 5.7 Mark first-run onboarding complete
+
+The app only opens into the overlay when **both** a valid provider key and a first-run sentinel exist. If configuration is complete, create the sentinel exactly as the app does. If no key was provided, do **not** create it; the user should see onboarding.
+
+```powershell
+if ($ApiKey -and $ProviderKeyValid) {
+  $sentinel = Join-Path $ConfigDir '.opencluely-firstrun-completed'
+  [System.IO.File]::WriteAllText(
+    $sentinel,
+    (Get-Date).ToUniversalTime().ToString('o'),
+    (New-Object System.Text.UTF8Encoding($false))
+  )
+  Write-Host "First-run sentinel created: $sentinel"
+}
+```
+
+### 5.8 Final config sanity check
+
+```powershell
+$raw = Get-Content $EnvPath -Raw
+if ($raw -notmatch '(?m)^\s*LLM_PROVIDER\s*=') { throw 'LLM_PROVIDER was not written to .env.' }
+if ($Provider -eq 'nvidia' -and $ApiKey -and $raw -notmatch '(?m)^\s*NVIDIA_API_KEY\s*=') {
+  throw 'NVIDIA_API_KEY was not written to .env.'
+}
+if ($Provider -eq 'gemini' -and $ApiKey -and $raw -notmatch '(?m)^\s*GEMINI_API_KEY\s*=') {
+  throw 'GEMINI_API_KEY was not written to .env.'
+}
+if ($VoiceInstalled -and $raw -notmatch '(?m)^\s*WHISPER_COMMAND\s*=') {
+  throw 'WHISPER_COMMAND was not written to .env.'
+}
+Write-Host '.env sanity check passed.'
+```
+
+---
+
+## Phase 6 — Launch and verify
+
+### 6.1 Clear any stale process and start the app
+
+```powershell
+Get-CimInstance Win32_Process -Filter "Name = 'OpenCluely.exe'" -ErrorAction SilentlyContinue |
+  ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+Start-Sleep -Seconds 2
+
+Start-Process -FilePath $ExePath -WorkingDirectory $InstallDir
+Start-Sleep -Seconds 15
+```
+
+### 6.2 Confirm the process is running
+
+```powershell
+$running = Get-CimInstance Win32_Process -Filter "Name = 'OpenCluely.exe'" |
+  Where-Object { $_.ExecutablePath -eq $ExePath }
+
+if (-not $running) {
+  throw 'OpenCluely is not running after launch. Check the application and error logs below.'
+}
+Write-Host "OpenCluely is running (PID $($running[0].ProcessId))."
+```
+
+### 6.3 Inspect application logs
+
+```powershell
+$logDir = Join-Path $HOME '.OpenCluely\logs'
+$appLog = Get-ChildItem $logDir -Filter 'application-*.log' -ErrorAction SilentlyContinue |
+  Sort-Object LastWriteTime -Descending | Select-Object -First 1
+
+if ($appLog) {
+  $tail = Get-Content $appLog.FullName -Tail 300
+  $tail | Select-String -Pattern 'Application starting|First-run status|Application initialized|Local Whisper ready|Application initialization failed'
+} else {
+  Write-Warning "No application log found at $logDir"
+}
+```
+
+Success indicators:
+
+- `Application starting`
+- `First-run status` with `needsOnboarding` showing `false` (when a key and sentinel were configured)
+- `Application initialized successfully`
+- `Local Whisper ready` when voice is installed
+- No recent `Application initialization failed`
+
+If `needsOnboarding` is still `true` while a key is configured, the app is reading a different config directory. Do this:
+
+1. Find the other `%APPDATA%\*cluely*` directory.
+2. Copy the same `.env` and sentinel there.
+3. Restart the app and re-check the log.
+
+### 6.4 Check for recent fatal errors
+
+```powershell
+$errorLog = Get-ChildItem $logDir -Filter 'error-*.log' -ErrorAction SilentlyContinue |
+  Sort-Object LastWriteTime -Descending | Select-Object -First 1
+
+if ($errorLog -and $errorLog.LastWriteTime -gt (Get-Date).AddMinutes(-10)) {
+  Get-Content $errorLog.FullName -Tail 100
+}
+```
+
+Ignore old errors from previous runs. Report new errors that occur after this installation.
+
+### 6.5 Verify shortcuts
+
+```powershell
+$desktopLnk = Join-Path ([Environment]::GetFolderPath('Desktop')) 'OpenCluely.lnk'
+$startMenus = @(
+  (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'),
+  (Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs')
+) | Where-Object { Test-Path $_ }
+
+$startLnk = @(
+  foreach ($menu in $startMenus) {
+    Get-ChildItem $menu -Recurse -Filter '*OpenCluely*.lnk' -ErrorAction SilentlyContinue
+  }
+) | Select-Object -First 1
+
+if (Test-Path $desktopLnk) { Write-Host "Desktop shortcut: $desktopLnk" } else { Write-Warning 'Desktop shortcut missing.' }
+if ($startLnk) { Write-Host "Start Menu shortcut: $($startLnk.FullName)" } else { Write-Warning 'Start Menu shortcut missing.' }
+```
+
+### 6.6 Verify configuration values without exposing secrets
+
+```powershell
+$check = Get-Content $EnvPath -Raw
+$masked = $check -replace '(?m)^(\s*)(NVIDIA_API_KEY|GEMINI_API_KEY)(\s*)=\s*.*$', '$1$2$3=***'
+$masked | Select-String -Pattern 'LLM_PROVIDER|NVIDIA_BASE_URL|NVIDIA_MODEL|SPEECH_PROVIDER|WHISPER_MODEL|WHISPER_LANGUAGE|WHISPER_ENGINE'
+```
+
+### 6.7 Leave the app in the right state
+
+- If a valid API key and sentinel were configured: leave OpenCluely running. The overlay should be available.
+- If no API key was supplied: leave the onboarding/settings window open so the user can paste the key. Do not terminate it.
+- If the user asked not to launch, close the app cleanly and skip this step.
+
+---
+
+## Phase 7 — Final report
+
+Return a concise report in chat with a table like this:
+
+| Item | Result |
+|---|---|
+| Release version | e.g. `1.8.7` |
+| Install path | `C:\Users\...\AppData\Local\Programs\OpenCluely` |
+| Config file | `C:\Users\...\AppData\Roaming\opencluely\.env` |
+| AI provider | `nvidia` or `gemini` |
+| API key | Configured / Pending user key / Invalid (details hidden) |
+| Whisper | Installed (`small`, language `en`) / Skipped / Failed (reason) |
+| Shortcuts | Start Menu: yes/no; Desktop: yes/no |
+| App running | yes/no |
+| Onboarding | Completed / Waiting for user key |
+| Warnings | Any non-fatal issues |
+
+Then add:
+
+- **How to use:** `Ctrl+Shift+S` screenshot, `Ctrl+Shift+V` show/hide, `Ctrl+Shift+C` chat, `Ctrl+Shift+I` click-through, `Ctrl+,` settings, `Alt+R` voice.
+- **Stealth mode:** the window and task-manager title may read “Terminal”. The real executable is still `OpenCluely.exe`, and Windows uninstall lists it as OpenCluely.
+- **If AI is not configured:** open the app, paste the provider key in onboarding or edit the `.env` path shown above, then restart.
+- **If voice is not working:** open Windows Settings → Privacy & security → Microphone and allow desktop apps; confirm the venv path in `.env` exists.
+- **Security:** `.env` contains secrets. Do not share or commit it.
+- **Uninstall:** Windows Settings → Apps → OpenCluely. To remove config, models, and logs too, delete `%APPDATA%\opencluely` (or `%APPDATA%\OpenCluely`) and `%USERPROFILE%\.OpenCluely`.
+- **Backups:** mention the `.env.backup-*` file if one was created.
+
+Never display the full API key.
+
+---
+
+## Acceptance checklist
+
+Do not call the installation complete unless all applicable items pass:
+
+- [ ] Windows build is 17763+ and the architecture is supported.
+- [ ] Installer downloaded from the official OpenCluely GitHub release.
+- [ ] SHA-256 matched, or the absence of a published checksum was explicitly reported.
+- [ ] Installer exited with code `0` (or a documented retry succeeded).
+- [ ] `OpenCluely.exe` exists and reports a version.
+- [ ] Start Menu shortcut exists; desktop shortcut exists or was created.
+- [ ] Config directory was discovered and `.env` exists there.
+- [ ] `LLM_PROVIDER` is set to `nvidia` or `gemini`.
+- [ ] A non-placeholder API key is present, **or** the report clearly states that the user must supply one.
+- [ ] Provided API key passed a provider connectivity test, or the failure is reported.
+- [ ] If voice was requested: venv exists, `openai-whisper` imports, `whisper --help` works, model files exist, and `WHISPER_COMMAND` points to the venv Python.
+- [ ] App process is running after launch.
+- [ ] Application log shows successful initialization and no new fatal errors.
+- [ ] If a key was configured, the first-run sentinel exists and `needsOnboarding` is `false`.
+- [ ] Final report is complete and masks secrets.
+
+If an item fails and cannot be fixed, state it plainly. A partial install with a clear remaining action is acceptable; a false claim of success is not.
+
+---
+
+## Failure handling summary
+
+| Failure | What to do |
+|---|---|
+| GitHub API rate-limited | Wait 60 s, retry once. If still blocked, use an existing install or source mode. Never use unofficial mirrors. |
+| Installer blocked by SmartScreen/Defender | Run `Unblock-File`; ask the user to approve “More info → Run anyway.” Do not disable security software. |
+| `winget` missing | Release mode: no action. Voice mode: use the official Python installer. Source mode: download official Git/Node installers. |
+| Python install fails | Install the official per-user Python 3.12 x64 installer. Check disk space and PATH. |
+| `pip install openai-whisper` fails | Check disk (needs several GB), network, and Python version. Install VC++ Redistributable if PyTorch DLLs are missing. Voice can be skipped. |
+| Model download fails | Continue. The app retries on first transcription. Report that first use needs internet. |
+| API key invalid | Keep it only if the user provided it; report the validation error. Leave onboarding available. |
+| App does not start | Check `%USERPROFILE%\.OpenCluely\logs\error-*.log`; try launching the exe directly with `--disable-gpu`; report the exact error. |
+| Config not picked up | Try the other `%APPDATA%\*cluely*` directory, copy `.env` and sentinel there, restart, and re-check the log. |
+| No admin rights | Release install is per-user and should work. Python can be per-user. Source build may require admin; report if not possible. |
+
+---
+
+## Appendix A — Source mode (optional)
+
+Use this only when `OPENCLUELY_INSTALL_MODE=source`, the user explicitly asks, or the release installer cannot be used. Building from source is slower and requires Node.js and Git.
+
+### A.1 Install build prerequisites
+
+```powershell
+$winget = Get-Command winget -ErrorAction SilentlyContinue
+if (-not $winget) { throw 'winget is required for the automated source setup. Install App Installer or use release mode.' }
+
+& winget install -e --id OpenJS.NodeJS.LTS --silent --accept-package-agreements --accept-source-agreements --disable-interactivity
+& winget install -e --id Git.Git --silent --accept-package-agreements --accept-source-agreements --disable-interactivity
+& winget install -e --id Python.Python.3.12 --scope user --silent --accept-package-agreements --accept-source-agreements --disable-interactivity
+
+$env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' +
+            [Environment]::GetEnvironmentVariable('Path','User')
+
+git config --global core.longpaths true
+node -v
+npm -v
+git --version
+```
+
+If `winget` is unavailable, download the official Node.js LTS MSI and Git for Windows installer from their official sites and install them silently. Python can use the per-user installer from Phase 4.
+
+### A.2 Get the source
+
+```powershell
+$cwdPkg = Join-Path (Get-Location) 'package.json'
+$cwdIsOpenCluely = $false
+if (Test-Path $cwdPkg) {
+  try {
+    $cwdIsOpenCluely = ((Get-Content $cwdPkg -Raw | ConvertFrom-Json).name -eq 'opencluely')
+  } catch { $cwdIsOpenCluely = $false }
+}
+
+$SourceDir = if ($env:OPENCLUELY_SOURCE_DIR) {
+  $env:OPENCLUELY_SOURCE_DIR
+} elseif ($cwdIsOpenCluely) {
+  (Get-Location).Path
+} else {
+  Join-Path $env:USERPROFILE 'OpenCluely'
+}
+
+if (-not (Test-Path (Join-Path $SourceDir 'package.json'))) {
+  git clone --depth 1 https://github.com/TechyCSR/OpenCluely.git $SourceDir
+}
+
+$pkg = Get-Content (Join-Path $SourceDir 'package.json') -Raw | ConvertFrom-Json
+if ($pkg.name -ne 'opencluely') {
+  throw "The directory $SourceDir is not an OpenCluely checkout."
+}
+
+Set-Location $SourceDir
+```
+
+If the user wants their local uncommitted changes, set `OPENCLUELY_SOURCE_DIR` to that checkout. Otherwise clone a clean copy. Uncommitted changes exist only on that PC; to install them on another PC, push the branch or copy the checkout and point `OPENCLUELY_SOURCE_DIR` at it.
+
+### A.3 Install dependencies and build
+
+```powershell
+# Make sure devDependencies (electron, electron-builder) are installed.
+Remove-Item Env:NODE_ENV -ErrorAction SilentlyContinue
+
+if (Test-Path 'package-lock.json') {
+  npm ci
+  if ($LASTEXITCODE -ne 0) { npm install }
+} else {
+  npm install
+}
+if ($LASTEXITCODE -ne 0) { throw 'npm install failed.' }
+
+npm run build:win -- --publish never
+if ($LASTEXITCODE -ne 0) { throw 'electron-builder failed to produce the Windows installer.' }
+
+$built = Get-ChildItem (Join-Path $SourceDir 'dist') -Filter 'OpenCluely-Setup-*.exe' -ErrorAction SilentlyContinue |
+  Sort-Object LastWriteTime -Descending | Select-Object -First 1
+if (-not $built) { throw 'Build succeeded but no OpenCluely-Setup-*.exe was found in dist.' }
+
+$InstallerPath = $built.FullName
+Write-Host "Built installer: $InstallerPath"
+```
+
+Then return to **Phase 2** and install the built artifact, followed by Phases 3–7.
+
+### A.4 Last-resort source run (no installer)
+
+Only if building fails but the user still wants to run the app:
+
+```powershell
+Set-Location $SourceDir
+Remove-Item Env:ELECTRON_RUN_AS_NODE -ErrorAction SilentlyContinue
+& (Join-Path $SourceDir 'node_modules\.bin\electron.cmd') $SourceDir
+```
+
+Report this as a **partial** installation: there is no installed app or normal shortcut. Do not use `npm start` on plain Windows.
+
+---
+
+## Appendix B — Uninstall / reset
+
+To uninstall:
+
+1. Close OpenCluely.
+2. Windows Settings → Apps → Installed apps → OpenCluely → Uninstall.
+3. Optionally delete the configuration and local voice data:
+   - `%APPDATA%\opencluely`
+   - `%APPDATA%\OpenCluely` (if it exists)
+   - `%USERPROFILE%\.OpenCluely` (logs)
+4. Optionally remove the downloaded installer and temporary folder:
+   - `%TEMP%\OpenCluely-install`
+
+Do not delete the config directory unless the user explicitly asks; it contains their API key, settings, and downloaded Whisper models.
+
+---
+
+## Final instruction to the agent
+
+Work through the phases in order. Perform the steps yourself with PowerShell; do not hand the user a list of commands unless a step genuinely requires their interaction (UAC, API key, microphone privacy). Run the verification. If something fails, try the documented fallback, then report exactly what remains. The installation is finished when the app is installed, configured, running, and the acceptance checklist is satisfied or the remaining user action is clearly stated.

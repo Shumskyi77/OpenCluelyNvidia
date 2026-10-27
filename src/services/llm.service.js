@@ -10,11 +10,59 @@ class LLMService {
     this.isInitialized = false;
     this.requestCount = 0;
     this.errorCount = 0;
-    
+    this.provider = 'gemini';
+    this.nvidiaBaseUrl = null;
+    this.nvidiaModel = null;
+    this.nvidiaApiKey = null;
+
     this.initializeClient();
   }
 
+  getLlmProvider() {
+    const raw = String(process.env.LLM_PROVIDER || config.get('llm.provider') || 'nvidia').trim().toLowerCase();
+    return raw === 'gemini' ? 'gemini' : 'nvidia';
+  }
+
+  getNvidiaSettings() {
+    const baseUrl = String(
+      process.env.NVIDIA_BASE_URL || config.get('llm.nvidia.baseUrl') || 'https://integrate.api.nvidia.com/v1'
+    ).replace(/\/+$/, '');
+    const model = String(
+      process.env.NVIDIA_MODEL || config.get('llm.nvidia.model') || 'google/diffusiongemma-26b-a4b-it'
+    ).trim();
+    return { baseUrl, model, apiKey: config.getApiKey('NVIDIA') };
+  }
+
+  _useNvidia() {
+    return this.provider === 'nvidia';
+  }
+
   initializeClient() {
+    this.provider = this.getLlmProvider();
+
+    const nvidia = this.getNvidiaSettings();
+    this.nvidiaBaseUrl = nvidia.baseUrl;
+    this.nvidiaModel = nvidia.model;
+    this.nvidiaApiKey = nvidia.apiKey;
+
+    if (this._useNvidia()) {
+      if (!this.nvidiaApiKey) {
+        logger.warn('NVIDIA API key not configured', { keyExists: false });
+        this.client = null;
+        this.model = this.nvidiaModel;
+        this.isInitialized = false;
+        return;
+      }
+      this.client = null;
+      this.model = this.nvidiaModel;
+      this.isInitialized = true;
+      logger.info('NVIDIA NIM client initialized successfully', {
+        model: this.model,
+        baseUrl: this.nvidiaBaseUrl
+      });
+      return;
+    }
+
     const apiKey = config.getApiKey('GEMINI');
     
     if (!apiKey || apiKey === 'your-api-key-here') {
@@ -28,7 +76,7 @@ class LLMService {
     try {
       this.client = new GoogleGenAI({ apiKey });
       
-      // Use the configured model name (default: gemini-3.5-flash)
+      // Use the configured model name (default: gemini-3.5-flash-lite)
       this.model = config.get('llm.gemini.model');
       this.isInitialized = true;
       
@@ -116,14 +164,14 @@ class LLMService {
    * For image-based queries, we include the skill prompt (e.g., DSA) as systemInstruction.
    * @param {Buffer} imageBuffer - PNG/JPEG image bytes
    * @param {string} mimeType - e.g., 'image/png' or 'image/jpeg'
-   * @param {string} activeSkill - current skill (e.g. 'dsa')
+   * @param {string} activeSkill - current skill (e.g. 'general')
    * @param {Array} sessionMemory - optional (not required for image)
    * @param {string|null} programmingLanguage - optional language context for skills that need it
    * @returns {Promise<{response: string, metadata: object}>}
    */
   async processImageWithSkill(imageBuffer, mimeType, activeSkill, sessionMemory = [], programmingLanguage = null) {
     if (!this.isInitialized) {
-      throw new Error('LLM service not initialized. Check Gemini API key configuration.');
+      throw new Error('LLM service not initialized. Check your AI provider API key in Settings.');
     }
 
     if (!imageBuffer || !Buffer.isBuffer(imageBuffer)) {
@@ -227,7 +275,7 @@ class LLMService {
 
   async processImageWithSkillStream(imageBuffer, mimeType, activeSkill, sessionMemory = [], programmingLanguage = null, onDelta = null) {
     if (!this.isInitialized) {
-      throw new Error('LLM service not initialized. Check Gemini API key configuration.');
+      throw new Error('LLM service not initialized. Check your AI provider API key in Settings.');
     }
 
     if (!imageBuffer || !Buffer.isBuffer(imageBuffer)) {
@@ -298,13 +346,13 @@ class LLMService {
   }
 
   formatImageInstruction(activeSkill, programmingLanguage) {
-    const langNote = programmingLanguage ? ` Use only ${programmingLanguage.toUpperCase()} for any code.` : '';
-    return `Analyze this image for a ${activeSkill.toUpperCase()} question. Extract the problem concisely and provide the best possible solution with explanation and final code.${langNote}`;
+    const langNote = programmingLanguage ? ` If code is needed, write it in ${programmingLanguage.toUpperCase()}.` : '';
+    return `Look at this image, extract the question being asked (any domain: math, physics, programming, languages, everyday topics — anything), then give a direct answer first followed by a brief explanation.${langNote} Respond ALWAYS in Polish. If it is a math problem, format all formulas with LaTeX ($...$ inline, $$...$$ display) and show the steps plus the final result.`;
   }
 
   async processTextWithSkill(text, activeSkill, sessionMemory = [], programmingLanguage = null) {
     if (!this.isInitialized) {
-      throw new Error('LLM service not initialized. Check Gemini API key configuration.');
+      throw new Error('LLM service not initialized. Check your AI provider API key in Settings.');
     }
 
     const startTime = Date.now();
@@ -391,7 +439,7 @@ class LLMService {
 
   async processTextWithSkillStream(text, activeSkill, sessionMemory = [], programmingLanguage = null, onDelta = null) {
     if (!this.isInitialized) {
-      throw new Error('LLM service not initialized. Check Gemini API key configuration.');
+      throw new Error('LLM service not initialized. Check your AI provider API key in Settings.');
     }
 
     const startTime = Date.now();
@@ -439,7 +487,7 @@ class LLMService {
 
   async processTranscriptionWithIntelligentResponse(text, activeSkill, sessionMemory = [], programmingLanguage = null) {
     if (!this.isInitialized) {
-      throw new Error('LLM service not initialized. Check Gemini API key configuration.');
+      throw new Error('LLM service not initialized. Check your AI provider API key in Settings.');
     }
 
     const startTime = Date.now();
@@ -779,11 +827,23 @@ class LLMService {
   }
 
   getIntelligentTranscriptionPrompt(activeSkill, programmingLanguage) {
-    let prompt = `# Intelligent Transcription Response System
+    let prompt = `# Universal Assistant — answer any question directly
 
-Assume you are asked a question in ${activeSkill.toUpperCase()} mode. Your job is to intelligently respond to question/message with appropriate brevity.
-Assume you are in an interview and you need to perform best in ${activeSkill.toUpperCase()} mode.
-Always respond to the point, do not repeat the question or unnecessary information which is not related to ${activeSkill}.`;
+You are a general-purpose assistant. The user can ask about ANYTHING: math, physics,
+programming, history, languages, work, study, everyday life. Always answer the question
+that was actually asked — never refuse, never redirect to another topic.
+
+## How to answer
+1. Direct answer first (1–3 lines, exactly what was asked).
+2. Then a brief explanation: key steps, reasoning, or a short example.
+3. Keep it simple and complete. No filler, no repeating the question.
+4. ALWAYS respond in Polish, no matter what language the user's question
+   is in. Code (if any) keeps its programming language, but every
+   explanation around it is in Polish.
+
+## Code questions
+- Only when the question asks for code (or clearly requires it), include clean code
+  with triple backticks and the correct language tag.`;
 
     // Add programming language context if provided
     if (programmingLanguage) {
@@ -792,53 +852,38 @@ Always respond to the point, do not repeat the question or unnecessary informati
       const fenceTagMap = { cpp: 'cpp', c: 'c', python: 'python', java: 'java', javascript: 'javascript', js: 'javascript' };
       const languageTitle = languageMap[lang] || (lang.charAt(0).toUpperCase() + lang.slice(1));
       const fenceTag = fenceTagMap[lang] || lang || 'text';
-      prompt += `\n\nCODING CONTEXT: Respond ONLY in ${languageTitle}. All code blocks must use triple backticks with language tag \`\`\`${fenceTag}\`\`\`. Do not include other languages unless explicitly asked.`;
+      prompt += `\n- When code is needed and no other language was requested, write it in ${languageTitle} (fences tagged \`\`\`${fenceTag}\`\`\`).`;
     }
 
     prompt += `
 
-## Response Rules:
+## Math questions — beautiful formatting (REQUIRED)
+- Format EVERY formula with LaTeX so it renders nicely:
+  - inline math: \`$...$\` (e.g. \`$x^2 + 2x + 1 = 0$\`)
+  - display formulas on their own lines: \`$$...$$\`
+- Use \\frac{a}{b}, x^{2}, x_{n}, \\sqrt{x}, \\sum, \\int, \\cdot, \\leq, \\geq,
+  \\neq, \\infty, \\pi and other standard LaTeX commands.
+- Solve step by step: given → steps → final result highlighted
+  (e.g. **Answer:** \`$$x = 2$$\`).
 
-### If the transcription is casual conversation, greetings, or NOT related to ${activeSkill}:
-- Respond with: "Yeah, I'm listening. Ask your question relevant to ${activeSkill}."
-- Or similar brief acknowledgments like: "I'm here, what's your ${activeSkill} question?"
+## What NOT to do
+- Do NOT say "ask a question relevant to X" — every question is relevant.
+- Do NOT force code into non-coding answers.
+- Do NOT give one-word answers without explanation, and do NOT over-explain either.
 
-### If the transcription IS relevant to ${activeSkill} or is a follow-up question:
-- Provide a comprehensive, detailed response
-- Use bullet points, examples, and explanations
-- Focus on actionable insights and complete answers
-- Do not truncate or shorten your response
-
-### Examples of casual/irrelevant messages:
-- "Hello", "Hi there", "How are you?"
-- "What's the weather like?"
-- "I'm just testing this"
-- Random conversations not related to ${activeSkill}
-
-### Examples of relevant messages:
-- Actual questions about ${activeSkill} concepts
-- Follow-up questions to previous responses
-- Requests for clarification on ${activeSkill} topics
-- Problem-solving requests related to ${activeSkill}
-
-## Response Format:
-- Keep responses detailed
-- Use bullet points for structured answers
-- Be encouraging and helpful
-- Stay focused on ${activeSkill}
-
-If the user's input is a coding or DSA problem statement and contains no code, produce a complete, runnable solution in the selected programming language without asking for more details. Always include the final implementation in a properly tagged code block.
-
-Remember: Be intelligent about filtering - only provide detailed responses when the user actually needs help with ${activeSkill}.`;
+Just answer the question simply, with a short explanation.`;
 
     return prompt;
   }
 
   formatUserMessage(text, activeSkill) {
-    return `Context: ${activeSkill.toUpperCase()} analysis request\n\nText to analyze:\n${text}`;
+    return `Question:\n${text}`;
   }
 
   async executeRequest(geminiRequest) {
+    if (this._useNvidia()) {
+      return this.executeNvidiaRequest(geminiRequest, null);
+    }
     const maxRetries = config.get('llm.gemini.maxRetries');
     const timeout = config.get('llm.gemini.timeout');
     const primaryModel = this.model;
@@ -980,7 +1025,7 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
    */
   async processTranscriptionWithIntelligentResponseStream(text, activeSkill, sessionMemory = [], programmingLanguage = null, onDelta = null) {
     if (!this.isInitialized) {
-      throw new Error('LLM service not initialized. Check Gemini API key configuration.');
+      throw new Error('LLM service not initialized. Check your AI provider API key in Settings.');
     }
 
     const startTime = Date.now();
@@ -1054,6 +1099,9 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
    * for each chunk.
    */
   async executeStreamingRequest(geminiRequest, onDelta) {
+    if (this._useNvidia()) {
+      return this.executeNvidiaRequest(geminiRequest, onDelta);
+    }
     const maxRetries = config.get('llm.gemini.maxRetries');
     const apiKey = config.getApiKey('GEMINI');
     const primaryModel = this.model;
@@ -1183,6 +1231,293 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
         reject(new Error('Streaming request timeout'));
       });
 
+      req.write(postData);
+      req.end();
+    });
+  }
+
+  /**
+   * Convert an internal Gemini-style request ({systemInstruction, contents})
+   * into OpenAI-compatible chat messages for NVIDIA NIM.
+   */
+  _toOpenAIMessages(geminiRequest) {
+    const messages = [];
+    const sysParts = (geminiRequest.systemInstruction && geminiRequest.systemInstruction.parts) || [];
+    const sysText = sysParts
+      .map((p) => (p && typeof p.text === 'string' ? p.text : ''))
+      .filter(Boolean)
+      .join('\n');
+    if (sysText) {
+      messages.push({ role: 'system', content: sysText });
+    }
+    for (const content of geminiRequest.contents || []) {
+      const role = content.role === 'model' ? 'assistant' : 'user';
+      const texts = [];
+      const images = [];
+      for (const part of content.parts || []) {
+        if (part && typeof part.text === 'string' && part.text) {
+          texts.push(part.text);
+        } else if (part && part.inlineData && part.inlineData.data) {
+          images.push({
+            type: 'image_url',
+            image_url: {
+              url: `data:${part.inlineData.mimeType || 'image/png'};base64,${part.inlineData.data}`
+            }
+          });
+        }
+      }
+      if (images.length > 0) {
+        messages.push({
+          role,
+          content: [{ type: 'text', text: texts.join('\n') || 'What is in this image?' }, ...images]
+        });
+      } else if (texts.length > 0) {
+        messages.push({ role, content: texts.join('\n') });
+      }
+    }
+    return messages;
+  }
+
+  /**
+   * Execute a request against NVIDIA NIM (OpenAI-compatible chat API).
+   * When onDelta is a function the request streams (SSE) and deltas are
+   * forwarded; otherwise a single JSON response is returned. Returns the
+   * full response text in both cases.
+   */
+  async executeNvidiaRequest(geminiRequest, onDelta = null) {
+    if (!this.nvidiaApiKey) {
+      throw new Error('NVIDIA API key not configured. Set it in Settings → AI Provider.');
+    }
+    const messages = this._toOpenAIMessages(geminiRequest);
+    if (!messages.length) {
+      throw new Error('No valid content to send to NVIDIA NIM');
+    }
+    // Diffusion/thinking models: demand minimal thinking and an immediate
+    // answer — otherwise they spend time on long internal reasoning.
+    if (this._nvidiaNeedsThinkingTemplate()) {
+      const speedNote = 'IMPORTANT: think as briefly as possible — do NOT reason step by step and do NOT show your thinking. Reply in AT MOST 3-4 short sentences with the key info only. Use the SIMPLEST everyday words, like a school student answering a question in their own words — no filler, no water, no fancy vocabulary, no introductions, no summaries, no bullet lists unless asked. Output ONLY the direct final answer immediately. Speed matters more than showing your work.';
+      const sys = messages.find((msg) => msg && msg.role === 'system');
+      if (sys && typeof sys.content === 'string') {
+        sys.content += `\n\n${speedNote}`;
+      } else {
+        messages.unshift({ role: 'system', content: speedNote });
+      }
+    }
+    const gen = (geminiRequest && geminiRequest.generationConfig) || {};
+    const nvidiaCfg = config.get('llm.nvidia') || {};
+    const body = {
+      model: this.nvidiaModel,
+      messages,
+      // Thinking/diffusion models (e.g. DiffusionGemma) need the thinking
+      // chat template enabled — without it they return an empty content.
+      // Only sent for such models so plain chat models never see an
+      // unknown field.
+      ...(this._nvidiaNeedsThinkingTemplate() ? { chat_template_kwargs: { enable_thinking: true } } : {}),
+      temperature: typeof nvidiaCfg.temperature === 'number' ? nvidiaCfg.temperature : 1,
+      top_p: typeof nvidiaCfg.topP === 'number' ? nvidiaCfg.topP : 0.95,
+      // Thinking models share one token budget between hidden thinking
+      // and the visible answer — keep it generous so answers are never
+      // cut mid-sentence; short answers come from the prompt, not the cap.
+      max_tokens: this._nvidiaNeedsThinkingTemplate()
+        ? Math.min(
+            typeof gen.maxOutputTokens === 'number' ? gen.maxOutputTokens : 4096,
+            typeof nvidiaCfg.thinkingMaxTokens === 'number' ? nvidiaCfg.thinkingMaxTokens : 4096
+          )
+        : (typeof gen.maxOutputTokens === 'number' ? gen.maxOutputTokens : 4096),
+      stream: typeof onDelta === 'function'
+    };
+
+    const maxRetries = config.get('llm.nvidia.maxRetries') || 2;
+    let lastError = null;
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        if (body.stream) {
+          const fullText = await this._nvidiaStreamChat(body, onDelta);
+          if (!fullText) {
+            throw new Error('Empty streamed response from NVIDIA NIM');
+          }
+          return fullText;
+        }
+        return await this._nvidiaJsonChat(body);
+      } catch (error) {
+        lastError = error;
+        logger.warn(`NVIDIA NIM attempt ${attempt} failed`, {
+          error: error.message,
+          remainingAttempts: maxRetries - attempt,
+          model: this.nvidiaModel
+        });
+        if (attempt === maxRetries) {
+          break;
+        }
+        await this.delay(1500 * attempt + Math.random() * 1000);
+      }
+    }
+    throw lastError || new Error('NVIDIA NIM request failed');
+  }
+
+  /**
+   * Thinking/diffusion models need `chat_template_kwargs.enable_thinking`,
+   * otherwise they answer with an empty `content` (reasoning only).
+   */
+  _nvidiaNeedsThinkingTemplate() {
+    return /diffusion|think|r1|reason/i.test(this.nvidiaModel || '');
+  }
+
+  _nvidiaRequestOptions(body) {
+    const timeout = config.get('llm.nvidia.timeout') || 45000;
+    const postData = JSON.stringify(body);
+    const https = require('https');
+    const url = `${this.nvidiaBaseUrl}/chat/completions`;
+    return {
+      url,
+      postData,
+      timeout,
+      options: {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${this.nvidiaApiKey}`,
+          Accept: body.stream ? 'text/event-stream' : 'application/json',
+          'Content-Length': Buffer.byteLength(postData),
+          'User-Agent': this.getUserAgent()
+        },
+        timeout,
+        agent: new https.Agent({ keepAlive: true, maxSockets: 1 })
+      }
+    };
+  }
+
+  _nvidiaJsonChat(body) {
+    const https = require('https');
+    const { url, postData, options } = this._nvidiaRequestOptions(body);
+    return new Promise((resolve, reject) => {
+      const req = https.request(url, options, (res) => {
+        let raw = '';
+        res.setEncoding('utf8');
+        res.on('data', (c) => { raw += c; });
+        res.on('end', () => {
+          if (res.statusCode < 200 || res.statusCode >= 300) {
+            reject(new Error(`NVIDIA NIM HTTP ${res.statusCode}: ${raw.slice(0, 500)}`));
+            return;
+          }
+          try {
+            const json = JSON.parse(raw);
+            // Thinking/diffusion models may leave `content` empty and put
+            // the answer into `reasoning_content` — accept either.
+            const message = (json && json.choices && json.choices[0] && json.choices[0].message) || {};
+            const finishReason = (json && json.choices && json.choices[0] && json.choices[0].finish_reason) || null;
+            const content = typeof message.content === 'string' ? message.content : '';
+            const reasoning = typeof message.reasoning_content === 'string' ? message.reasoning_content : '';
+            const text = content.trim() || reasoning.trim();
+            if (!text) {
+              const keys = message && typeof message === 'object' ? Object.keys(message).join(',') : 'none';
+              reject(new Error(`Empty response from NVIDIA NIM (message fields: ${keys || 'none'})`));
+              return;
+            }
+            if (finishReason === 'length') {
+              logger.warn('NVIDIA NIM answer may be cut by the token limit', { finishReason });
+            }
+            resolve(text);
+          } catch (e) {
+            reject(new Error(`Invalid NVIDIA NIM response: ${e.message}`));
+          }
+        });
+        res.on('error', (error) => reject(new Error(`NVIDIA NIM response error: ${error.message}`)));
+      });
+      req.on('error', (error) => reject(new Error(`NVIDIA NIM request failed: ${error.message}`)));
+      req.on('timeout', () => {
+        req.destroy();
+        reject(new Error('NVIDIA NIM request timeout'));
+      });
+      req.write(postData);
+      req.end();
+    });
+  }
+
+  _nvidiaStreamChat(body, onDelta) {
+    const https = require('https');
+    const { url, postData, options } = this._nvidiaRequestOptions(body);
+    return new Promise((resolve, reject) => {
+      const req = https.request(url, options, (res) => {
+        if (res.statusCode !== 200) {
+          let errBody = '';
+          res.on('data', (c) => { errBody += c; });
+          res.on('end', () => reject(new Error(`NVIDIA NIM HTTP ${res.statusCode}: ${errBody.slice(0, 500)}`)));
+          return;
+        }
+        let fullText = '';
+        let reasonText = '';
+        let buffer = '';
+        let sawDone = false;
+        let finishReason = null;
+        res.setEncoding('utf8');
+        res.on('data', (chunk) => {
+          buffer += chunk;
+          let idx;
+          while ((idx = buffer.indexOf('\n')) !== -1) {
+            const line = buffer.slice(0, idx).trim();
+            buffer = buffer.slice(idx + 1);
+            if (!line.startsWith('data:')) {
+              continue;
+            }
+            const payload = line.slice(5).trim();
+            if (!payload) {
+              continue;
+            }
+            if (payload === '[DONE]') {
+              sawDone = true;
+              continue;
+            }
+            try {
+              const json = JSON.parse(payload);
+              const choice = (json && json.choices && json.choices[0]) || {};
+              if (choice.finish_reason) {
+                finishReason = choice.finish_reason;
+              }
+              const delta = choice.delta || {};
+              const think = delta.reasoning_content || '';
+              if (think) {
+                reasonText += think;
+              }
+              const piece = delta.content || '';
+              if (piece) {
+                fullText += piece;
+                if (typeof onDelta === 'function') {
+                  onDelta(piece);
+                }
+              }
+            } catch (_) {
+              // Partial JSON across chunk boundaries; skip unparsable lines.
+            }
+          }
+        });
+        res.on('end', () => {
+          // Thinking-only answer: flush the reasoning as the response so the
+          // UI never shows an empty bubble.
+          let finalText = fullText.trim();
+          if (!finalText && reasonText.trim() && typeof onDelta === 'function') {
+            onDelta(reasonText.trim());
+            finalText = reasonText.trim();
+          }
+          if (finishReason === 'length') {
+            logger.warn('NVIDIA NIM streamed answer may be cut by the token limit', { finishReason });
+          }
+          // A stream that ends without the [DONE] terminator was cut off
+          // mid-flight (dropped connection) — fail loudly so the caller
+          // retries / falls back instead of showing a half answer as final.
+          if (!sawDone) {
+            reject(new Error('NVIDIA NIM stream ended without completion marker; response may be incomplete'));
+            return;
+          }
+          resolve(finalText);
+        });
+        res.on('error', (error) => reject(new Error(`NVIDIA NIM streaming error: ${error.message}`)));
+      });
+      req.on('error', (error) => reject(new Error(`NVIDIA NIM request failed: ${error.message}`)));
+      req.on('timeout', () => {
+        req.destroy();
+        reject(new Error('NVIDIA NIM request timeout'));
+      });
       req.write(postData);
       req.end();
     });
@@ -1326,15 +1661,8 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
   generateFallbackResponse(text, activeSkill) {
     logger.info('Generating fallback response', { activeSkill });
 
-    const fallbackResponses = {
-      'dsa': 'This appears to be a data structures and algorithms problem. Consider breaking it down into smaller components and identifying the appropriate algorithm or data structure to use.',
-      'system-design': 'For this system design question, consider scalability, reliability, and the trade-offs between different architectural approaches.',
-      'programming': 'This looks like a programming challenge. Focus on understanding the requirements, edge cases, and optimal time/space complexity.',
-      'default': 'I can help analyze this content. Please ensure your Gemini API key is properly configured for detailed analysis.'
-    };
+    const response = 'Nie mogę teraz połączyć się z usługą AI. Sprawdź klucz API i połączenie z internetem, a następnie zadaj pytanie ponownie — odpowiadam na pytania z każdej dziedziny z krótkim wyjaśnieniem.';
 
-    const response = fallbackResponses[activeSkill] || fallbackResponses.default;
-    
     return {
       response,
       metadata: {
@@ -1349,33 +1677,11 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
   generateIntelligentFallbackResponse(text, activeSkill) {
     logger.info('Generating intelligent fallback response for transcription', { activeSkill });
 
-    // Simple heuristic to determine if message seems skill-related
-    const skillKeywords = {
-      'dsa': ['algorithm', 'data structure', 'array', 'tree', 'graph', 'sort', 'search', 'complexity', 'big o'],
-      'programming': ['code', 'function', 'variable', 'class', 'method', 'bug', 'debug', 'syntax'],
-      'system-design': ['scalability', 'database', 'architecture', 'microservice', 'load balancer', 'cache'],
-      'behavioral': ['interview', 'experience', 'situation', 'leadership', 'conflict', 'team'],
-      'sales': ['customer', 'deal', 'negotiation', 'price', 'revenue', 'prospect'],
-      'presentation': ['slide', 'audience', 'public speaking', 'presentation', 'nervous'],
-      'data-science': ['data', 'model', 'machine learning', 'statistics', 'analytics', 'python', 'pandas'],
-      'devops': ['deployment', 'ci/cd', 'docker', 'kubernetes', 'infrastructure', 'monitoring'],
-      'negotiation': ['negotiate', 'compromise', 'agreement', 'terms', 'conflict resolution']
-    };
-
-    const textLower = text.toLowerCase();
-    const relevantKeywords = skillKeywords[activeSkill] || [];
-    const hasRelevantKeywords = relevantKeywords.some(keyword => textLower.includes(keyword));
-    
-    // Check for question indicators
-    const questionIndicators = ['how', 'what', 'why', 'when', 'where', 'can you', 'could you', 'should i', '?'];
-    const seemsLikeQuestion = questionIndicators.some(indicator => textLower.includes(indicator));
-
-    let response;
-    if (hasRelevantKeywords || seemsLikeQuestion) {
-      response = `I'm having trouble processing that right now, but it sounds like a ${activeSkill} question. Could you rephrase or ask more specifically about what you need help with?`;
-    } else {
-      response = `Yeah, I'm listening. Ask your question relevant to ${activeSkill}.`;
-    }
+    const cleanText = (text || '').trim();
+    // Universal assistant: never refuse — acknowledge and invite a rephrase.
+    const response = cleanText
+      ? `Usłyszałem: "${cleanText.length > 160 ? cleanText.substring(0, 160) + '…' : cleanText}". Usługa AI jest teraz nieosiągalna — sprawdź połączenie i klucz API, a następnie zapytaj ponownie, a odpowiem z krótkim wyjaśnieniem.`
+      : 'Słucham. Zadaj pytanie, a odpowiem z krótkim wyjaśnieniem.';
     
     return {
       response,
@@ -1392,6 +1698,10 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
   async testConnection() {
     if (!this.isInitialized) {
       return { success: false, error: 'Service not initialized' };
+    }
+
+    if (this._useNvidia()) {
+      return this.testNvidiaConnection();
     }
 
     try {
@@ -1480,6 +1790,49 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
     }
   }
 
+  async testNvidiaConnection() {
+    const startTime = Date.now();
+    try {
+      const text = await this._nvidiaJsonChat({
+        model: this.nvidiaModel,
+        messages: [{ role: 'user', content: 'Test connection. Please respond with "OK".' }],
+        ...(this._nvidiaNeedsThinkingTemplate() ? { chat_template_kwargs: { enable_thinking: true } } : {}),
+        temperature: 1,
+        max_tokens: 64,
+        stream: false
+      });
+      const latency = Date.now() - startTime;
+      logger.info('NVIDIA NIM connection test successful', {
+        response: text,
+        latency,
+        model: this.nvidiaModel
+      });
+      return {
+        success: true,
+        response: text,
+        latency,
+        model: this.nvidiaModel,
+        provider: 'nvidia'
+      };
+    } catch (error) {
+      const msg = (error.message || '').toLowerCase();
+      let friendly;
+      if (msg.includes('401') || msg.includes('403') || msg.includes('api key') || msg.includes('unauthorized')) {
+        friendly = 'Nieprawidłowy klucz API NVIDIA. Sprawdź klucz na build.nvidia.com.';
+      } else if (msg.includes('404') || msg.includes('model')) {
+        friendly = 'Model NVIDIA jest niedostępny. Sprawdź nazwę modelu w Settings.';
+      } else if (msg.includes('429') || msg.includes('quota') || msg.includes('rate limit')) {
+        friendly = 'Przekroczono limit / quota NVIDIA. Poczekaj chwilę i spróbuj ponownie.';
+      } else if (msg.includes('timeout') || msg.includes('enotfound') || msg.includes('econn')) {
+        friendly = 'Nie można połączyć się z serwerami NVIDIA. Sprawdź internet, firewall lub VPN.';
+      } else {
+        friendly = error.message || 'Connection failed';
+      }
+      logger.error('NVIDIA NIM connection test failed', { error: error.message });
+      return { success: false, error: friendly, provider: 'nvidia' };
+    }
+  }
+
   /**
    * Translate raw SDK / network errors into something a user can act on.
    */
@@ -1488,22 +1841,22 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
     const raw = (error?.message || '').toLowerCase();
 
     if (type === 'NETWORK_ERROR' || raw.includes('fetch failed') || raw.includes('enotfound')) {
-      return 'Cannot reach Google servers. Check your internet connection, firewall, or VPN settings.';
+      return 'Nie można połączyć się z serwerami Google. Sprawdź internet, firewall lub VPN.';
     }
     if (type === 'AUTH_ERROR' || raw.includes('api key') || raw.includes('401') || raw.includes('403')) {
-      return 'Invalid API key or insufficient permissions. Double-check the key at aistudio.google.com/apikey.';
+      return 'Nieprawidłowy klucz API lub brak uprawnień. Sprawdź klucz na aistudio.google.com/apikey.';
     }
     if (type === 'RATE_LIMIT_ERROR' || raw.includes('429') || raw.includes('quota')) {
-      return 'Rate limit or quota exceeded. Wait a moment or check your Google Cloud billing.';
+      return 'Przekroczono limit lub quota. Poczekaj chwilę lub sprawdź billing Google Cloud.';
     }
     if (type === 'TIMEOUT_ERROR') {
-      return 'Request timed out. The Google API may be slow or unreachable right now.';
+      return 'Przekroczono czas żądania. API Google może być wolne lub nieosiągalne.';
     }
     if (type === 'MODEL_ERROR' || raw.includes('model') || raw.includes('404')) {
-      return 'The configured Gemini model is unavailable. Try a different model in Settings.';
+      return 'Skonfigurowany model Gemini jest niedostępny. Wybierz inny model w Settings.';
     }
     if (raw.includes('503') || raw.includes('unavailable') || raw.includes('high demand')) {
-      return 'Gemini is experiencing high demand. Please wait a moment and try again.';
+      return 'Gemini jest przeciążone. Poczekaj chwilę i spróbuj ponownie.';
     }
     // Fall back to a stripped-down raw message (no SDK prefix noise)
     return (error?.message || 'Connection failed').replace(/^\[(GoogleGenerativeAI|GoogleGenAI) Error\]:\s*/i, '');
@@ -1519,10 +1872,17 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
 
   getStats() {
     return {
+      provider: this.provider,
       isInitialized: this.isInitialized,
       requestCount: this.requestCount,
       errorCount: this.errorCount,
       successRate: this.requestCount > 0 ? ((this.requestCount - this.errorCount) / this.requestCount) * 100 : 0,
+      model: this.model,
+      nvidia: {
+        baseUrl: this.nvidiaBaseUrl,
+        model: this.nvidiaModel,
+        hasApiKey: !!this.nvidiaApiKey
+      },
       config: config.get('llm.gemini')
     };
   }
@@ -1532,6 +1892,9 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
   }
 
   async executeAlternativeRequest(geminiRequest) {
+    if (this._useNvidia()) {
+      return this.executeNvidiaRequest(geminiRequest, null);
+    }
     const https = require('https');
     const apiKey = config.getApiKey('GEMINI');
     const primaryModel = config.get('llm.gemini.model');

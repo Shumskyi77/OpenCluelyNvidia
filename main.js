@@ -112,7 +112,7 @@ class ApplicationController {
   constructor() {
     this.isReady = false;
     this.starting = false;
-    this.activeSkill = "dsa";
+    this.activeSkill = "general";
   // Default to C++ so language is enforced from first run
   this.codingLanguage = "cpp";
     this.speechAvailable = false;
@@ -334,6 +334,33 @@ class ApplicationController {
 
   setupPermissions() {
     const appSession = session.defaultSession;
+    // System-audio (loopback) capture: when the renderer asks for screen
+    // audio via getDisplayMedia, auto-grant the primary screen with loopback
+    // audio instead of showing a source picker. The renderer stops the video
+    // track immediately — only the audio loopback is used and mixed with
+    // the microphone. If loopback is unsupported, the audio track is simply
+    // absent and the app falls back to microphone-only capture.
+    try {
+      const { desktopCapturer } = require("electron");
+      appSession.setDisplayMediaRequestHandler((request, callback) => {
+        desktopCapturer
+          .getSources({ types: ["screen"] })
+          .then((sources) => {
+            if (!sources.length) {
+              callback({});
+              return;
+            }
+            callback({ video: sources[0], audio: "loopback" });
+          })
+          .catch(() => {
+            try { callback({}); } catch (_) { /* ignore */ }
+          });
+      });
+    } catch (e) {
+      logger.warn("Could not install display-media handler; system audio capture disabled", {
+        error: e.message,
+      });
+    }
     const isTrustedAppContents = (webContents) => {
       if (!webContents || webContents.isDestroyed()) {
         return false;
@@ -691,6 +718,11 @@ class ApplicationController {
       return await llmService.testConnection();
     });
 
+    // Provider-aware connection test (uses the currently active AI provider).
+    ipcMain.handle("test-llm-connection", async () => {
+      return await llmService.testConnection();
+    });
+
     ipcMain.handle("run-gemini-diagnostics", async () => {
       try {
         const connectivity = await llmService.checkNetworkConnectivity();
@@ -849,8 +881,8 @@ class ApplicationController {
     });
 
     ipcMain.handle("update-active-skill", (event, skill) => {
-      this.activeSkill = skill;
-      windowManager.broadcastToAllWindows("skill-changed", { skill });
+      this.activeSkill = this.normalizeSkill(skill);
+      windowManager.broadcastToAllWindows("skill-changed", { skill: this.activeSkill });
       return { success: true };
     });
 
@@ -924,8 +956,8 @@ class ApplicationController {
 
     // Handle update skill
     ipcMain.on("update-skill", (event, skill) => {
-      this.activeSkill = skill;
-      windowManager.broadcastToAllWindows("skill-updated", { skill });
+      this.activeSkill = this.normalizeSkill(skill);
+      windowManager.broadcastToAllWindows("skill-updated", { skill: this.activeSkill });
     });
 
     // Handle quit app (alternative method)
@@ -1027,9 +1059,21 @@ class ApplicationController {
     // Interactive mode: Right arrow does nothing
   }
 
+  /**
+   * Map legacy interview-only skill names to the universal assistant.
+   * Old configs may still store 'dsa' — keep it working, everything else
+   * becomes 'general' so one question always gets one direct answer.
+   */
+  normalizeSkill(skill) {
+    if (!skill || typeof skill !== "string") return "general";
+    const s = skill.toLowerCase().trim();
+    if (s === "dsa") return "dsa";
+    return "general";
+  }
+
   navigateSkill(direction) {
     const availableSkills = [
-      "dsa",
+      "general",
     ];
 
     const currentIndex = availableSkills.indexOf(this.activeSkill);
@@ -1087,7 +1131,7 @@ class ApplicationController {
       // Use image directly with LLM and active skill; do not send chat messages here
       const sessionHistory = sessionManager.getOptimizedHistory();
 
-      const skillsRequiringProgrammingLanguage = ['dsa'];
+      const skillsRequiringProgrammingLanguage = ['general', 'dsa'];
       const needsProgrammingLanguage = skillsRequiringProgrammingLanguage.includes(this.activeSkill);
 
       this._responseSeq = (this._responseSeq || 0) + 1;
@@ -1134,7 +1178,8 @@ class ApplicationController {
       });
 
       windowManager.hideLLMResponse();
-      this.broadcastOCRError(error.message);
+      this.broadcastOCRError(this._friendlyLlmError(error));
+      this.broadcastLLMError(this._friendlyLlmError(error));
       
       sessionManager.addConversationEvent({
         role: 'system',
@@ -1153,7 +1198,7 @@ class ApplicationController {
       sessionManager.addUserInput(text, 'llm_input');
 
       // Check if current skill needs programming language context
-      const skillsRequiringProgrammingLanguage = ['dsa'];
+      const skillsRequiringProgrammingLanguage = ['general', 'dsa'];
       const needsProgrammingLanguage = skillsRequiringProgrammingLanguage.includes(this.activeSkill);
 
       this._responseSeq = (this._responseSeq || 0) + 1;
@@ -1217,7 +1262,7 @@ class ApplicationController {
         }
       });
 
-      this.broadcastLLMError(error.message);
+      this.broadcastLLMError(this._friendlyLlmError(error));
     }
   }
 
@@ -1322,7 +1367,7 @@ class ApplicationController {
       });
 
       // Check if current skill needs programming language context
-      const skillsRequiringProgrammingLanguage = ['dsa'];
+      const skillsRequiringProgrammingLanguage = ['general', 'dsa'];
       const needsProgrammingLanguage = skillsRequiringProgrammingLanguage.includes(this.activeSkill);
 
       // Stream the answer progressively to the configured speech target.
@@ -1402,6 +1447,9 @@ class ApplicationController {
         });
 
         this.sendTranscriptionLLMResponseToVoiceTargets(fallbackResult);
+        // Also surface WHY it failed so the user can fix it (missing key,
+        // 401, network, …) instead of guessing from the generic fallback.
+        this.broadcastLLMError(this._friendlyLlmError(error));
         if (this.shouldShowVoiceOverlay()) {
           windowManager.showLLMResponse(fallbackResult.response, {
             skill: this.activeSkill,
@@ -1469,6 +1517,36 @@ class ApplicationController {
       error: errorMessage,
       timestamp: new Date().toISOString(),
     });
+  }
+
+  /**
+   * Translate a raw LLM failure into an actionable message naming the
+   * active provider, so the user sees WHY answering failed (missing key,
+   * 401, network, …) instead of only a generic fallback bubble.
+   */
+  _friendlyLlmError(error) {
+    const raw = (error && error.message) || String(error || "Unknown error");
+    const msg = raw.toLowerCase();
+    const provider = (llmService && llmService.provider) || "nvidia";
+    const providerName = provider === "nvidia" ? "NVIDIA NIM" : "Gemini";
+    if (msg.includes("not initialized") || msg.includes("api key not configured")) {
+      return provider === "nvidia"
+        ? "Brakuje klucza API NVIDIA. Otwórz Settings → AI Provider, wybierz NVIDIA NIM, wklej klucz nvapi-… i naciśnij Test connection."
+        : "Brakuje klucza API Gemini. Otwórz Settings → AI Provider, wybierz Google Gemini i wklej klucz.";
+    }
+    if (msg.includes("401") || msg.includes("403") || msg.includes("invalid api key") || msg.includes("unauthorized")) {
+      return `${providerName}: nieprawidłowy klucz API (401/403). Sprawdź klucz w Settings → AI Provider.`;
+    }
+    if (msg.includes("404")) {
+      return `${providerName}: nie znaleziono modelu (404). Sprawdź nazwę modelu w Settings → AI Provider.`;
+    }
+    if (msg.includes("429") || msg.includes("quota") || msg.includes("rate limit")) {
+      return `${providerName}: przekroczono limit / quota. Poczekaj chwilę i spróbuj ponownie.`;
+    }
+    if (msg.includes("timeout") || msg.includes("enotfound") || msg.includes("econn") || msg.includes("fetch failed") || msg.includes("network")) {
+      return `${providerName} jest nieosiągalny (sieć/timeout). Sprawdź internet, firewall lub VPN.`;
+    }
+    return `Błąd ${providerName}: ${raw.slice(0, 300)}`;
   }
 
   broadcastTranscriptionLLMResponse(llmResult) {
@@ -1590,7 +1668,7 @@ class ApplicationController {
     // distinguish "unset" from "stale value from a previous load".
     return {
       codingLanguage: this.codingLanguage || "cpp",
-      activeSkill: this.activeSkill || "dsa",
+      activeSkill: this.normalizeSkill(this.activeSkill) || "general",
       appIcon: this.appIcon || "terminal",
       selectedIcon: this.appIcon || "terminal",
       windowGap: windowManager.windowGap,
@@ -1600,13 +1678,19 @@ class ApplicationController {
       azureRegion: process.env.AZURE_SPEECH_REGION || "",
       whisperCommand: process.env.WHISPER_COMMAND || "",
       whisperModel: process.env.WHISPER_MODEL || "small",
-      whisperLanguage: process.env.WHISPER_LANGUAGE || "auto",
+      whisperLanguage: process.env.WHISPER_LANGUAGE || "pl",
       whisperDevice: process.env.WHISPER_DEVICE || "auto",
       whisperCaptureMode: process.env.WHISPER_CAPTURE_MODE ||
         (process.env.WHISPER_MANUAL_CAPTURE === "true" ? "manual" : "vad"),
       whisperResponseTarget: process.env.WHISPER_RESPONSE_TARGET || "both",
       whisperSegmentMs: process.env.WHISPER_SEGMENT_MS || "4000",
+      audioSource: process.env.AUDIO_SOURCE || "both",
+      whisperEngine: process.env.WHISPER_ENGINE || "auto",
       geminiKey: process.env.GEMINI_API_KEY || "",
+      llmProvider: process.env.LLM_PROVIDER || "nvidia",
+      nvidiaKey: process.env.NVIDIA_API_KEY || "",
+      nvidiaBaseUrl: process.env.NVIDIA_BASE_URL || "https://integrate.api.nvidia.com/v1",
+      nvidiaModel: process.env.NVIDIA_MODEL || "google/diffusiongemma-26b-a4b-it",
 
       azureConfigured: !!process.env.AZURE_SPEECH_KEY && !!process.env.AZURE_SPEECH_REGION,
       speechAvailable: this.speechAvailable
@@ -1623,9 +1707,9 @@ class ApplicationController {
         });
       }
       if (settings.activeSkill) {
-        this.activeSkill = settings.activeSkill;
+        this.activeSkill = this.normalizeSkill(settings.activeSkill);
         windowManager.broadcastToAllWindows("skill-updated", {
-          skill: settings.activeSkill,
+          skill: this.activeSkill,
         });
       }
       if (settings.appIcon) {
@@ -1675,8 +1759,26 @@ class ApplicationController {
       if (settings.whisperSegmentMs !== undefined) {
         envUpdates.WHISPER_SEGMENT_MS = String(settings.whisperSegmentMs);
       }
+      if (["mic", "system", "both"].includes(settings.audioSource)) {
+        envUpdates.AUDIO_SOURCE = settings.audioSource;
+      }
+      if (["auto", "faster", "openai"].includes(settings.whisperEngine)) {
+        envUpdates.WHISPER_ENGINE = settings.whisperEngine;
+      }
       if (settings.geminiKey !== undefined) {
         envUpdates.GEMINI_API_KEY = settings.geminiKey;
+      }
+      if (settings.llmProvider === "gemini" || settings.llmProvider === "nvidia") {
+        envUpdates.LLM_PROVIDER = settings.llmProvider;
+      }
+      if (settings.nvidiaKey !== undefined) {
+        envUpdates.NVIDIA_API_KEY = settings.nvidiaKey;
+      }
+      if (settings.nvidiaBaseUrl !== undefined) {
+        envUpdates.NVIDIA_BASE_URL = settings.nvidiaBaseUrl;
+      }
+      if (settings.nvidiaModel !== undefined) {
+        envUpdates.NVIDIA_MODEL = settings.nvidiaModel;
       }
 
       // Capture the previous whisper command BEFORE persisting — persistEnvUpdates
@@ -1687,17 +1789,20 @@ class ApplicationController {
 
       const persistedKeys = this.persistEnvUpdates(envUpdates);
 
-      // If the Gemini key was just saved, reinitialize the LLM service
-      // so the new client picks up the key. Without this, the test-
-      // connection button in the onboarding wizard fails with
-      // "Service not initialized" because the client was first created
-      // at app startup, before any key was set.
-      if (settings.geminiKey !== undefined && envUpdates.GEMINI_API_KEY !== undefined) {
+      // If an AI provider key/model was just saved, reinitialize the LLM
+      // service so the new settings take effect immediately.
+      const llmSettingsChanged =
+        (settings.geminiKey !== undefined && envUpdates.GEMINI_API_KEY !== undefined) ||
+        settings.llmProvider !== undefined ||
+        settings.nvidiaKey !== undefined ||
+        settings.nvidiaBaseUrl !== undefined ||
+        settings.nvidiaModel !== undefined;
+      if (llmSettingsChanged) {
         try {
           llmService.initializeClient();
-          logger.info("LLM service reinitialized after Gemini key update");
+          logger.info("LLM service reinitialized after AI provider settings update");
         } catch (e) {
-          logger.warn("Failed to reinitialize LLM service after Gemini key update", {
+          logger.warn("Failed to reinitialize LLM service after AI provider settings update", {
             error: e.message
           });
         }

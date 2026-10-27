@@ -317,6 +317,7 @@
                             <div class="settings-item-description">Choose your current focus area</div>
                         </div>
                         <select class="input-field" id="activeSkill">
+                            <option value="general">General Assistant (any topic)</option>
                             <option value="dsa">Data Structures & Algorithms</option>
                         </select>
                     </div>
@@ -402,9 +403,9 @@
                         <div class="settings-item">
                             <div>
                                 <div class="settings-item-label">Whisper Language</div>
-                                <div class="settings-item-description">Language code or auto-detection for local transcription</div>
+                                <div class="settings-item-description">Language code for local transcription (default: Polish — "pl")</div>
                             </div>
-                            <input type="text" class="input-field" id="whisperLanguage" placeholder="auto">
+                            <input type="text" class="input-field" id="whisperLanguage" placeholder="pl">
                         </div>
                         <div class="settings-item">
                             <div>
@@ -415,6 +416,28 @@
                                 <option value="auto">Auto</option>
                                 <option value="cpu">CPU</option>
                                 <option value="cuda">CUDA</option>
+                            </select>
+                        </div>
+                        <div class="settings-item">
+                            <div>
+                                <div class="settings-item-label">Transcription Engine</div>
+                                <div class="settings-item-description">Auto uses faster-whisper when installed (2–4× faster CPU), else openai-whisper</div>
+                            </div>
+                            <select class="input-field" id="whisperEngine">
+                                <option value="auto">Auto (recommended)</option>
+                                <option value="faster">faster-whisper</option>
+                                <option value="openai">openai-whisper</option>
+                            </select>
+                        </div>
+                        <div class="settings-item">
+                            <div>
+                                <div class="settings-item-label">Audio Source</div>
+                                <div class="settings-item-description">Microphone, system sound, or both mixed together</div>
+                            </div>
+                            <select class="input-field" id="audioSource">
+                                <option value="both">Microphone + system</option>
+                                <option value="mic">Microphone only</option>
+                                <option value="system">System sound only</option>
                             </select>
                         </div>
                         <div class="settings-item">
@@ -459,15 +482,68 @@
             <div class="settings-section">
                 <div class="settings-section-title">
                     <i class="fas fa-robot"></i>
-                    Gemini Settings
+                    AI Provider
                 </div>
                 <div class="settings-section-content">
                     <div class="settings-item">
                         <div>
-                            <div class="settings-item-label">Google API Key</div>
-                            <div class="settings-item-description">Your Google API key for Gemini models</div>
+                            <div class="settings-item-label">Provider</div>
+                            <div class="settings-item-description">Choose Google Gemini or NVIDIA NIM (OpenAI-compatible API)</div>
                         </div>
-                        <input type="password" class="input-field" id="geminiKey" placeholder="Enter your Google API key">
+                        <select class="input-field" id="llmProvider">
+                            <option value="gemini">Google Gemini</option>
+                            <option value="nvidia">NVIDIA NIM</option>
+                        </select>
+                    </div>
+
+                    <!-- Gemini fields (shown only when Gemini is selected) -->
+                    <div id="geminiFields" class="settings-group">
+                        <div class="settings-item">
+                            <div>
+                                <div class="settings-item-label">Google API Key</div>
+                                <div class="settings-item-description">Your Google API key for Gemini models</div>
+                            </div>
+                            <input type="password" class="input-field" id="geminiKey" placeholder="Enter your Google API key">
+                        </div>
+                    </div>
+
+                    <!-- NVIDIA fields (shown only when NVIDIA is selected) -->
+                    <div id="nvidiaFields" class="settings-group">
+                        <div class="settings-item">
+                            <div>
+                                <div class="settings-item-label">NVIDIA API Key</div>
+                                <div class="settings-item-description">Your NVIDIA NIM key (nvapi-… from build.nvidia.com)</div>
+                            </div>
+                            <input type="password" class="input-field" id="nvidiaKey" placeholder="nvapi-…">
+                        </div>
+                        <div class="settings-item">
+                            <div>
+                                <div class="settings-item-label">Base URL</div>
+                                <div class="settings-item-description">NIM endpoint base URL (OpenAI-compatible)</div>
+                            </div>
+                            <input type="text" class="input-field" id="nvidiaBaseUrl" placeholder="https://integrate.api.nvidia.com/v1">
+                        </div>
+                        <div class="settings-item">
+                            <div>
+                                <div class="settings-item-label">Model</div>
+                                <div class="settings-item-description">NIM model name, e.g. google/diffusiongemma-26b-a4b-it</div>
+                            </div>
+                            <input type="text" class="input-field" id="nvidiaModel" placeholder="google/diffusiongemma-26b-a4b-it" style="max-width: 100%;">
+                        </div>
+                        <div class="settings-item">
+                            <button class="btn" id="testLlmButton" type="button">
+                                <i class="fas fa-plug"></i>
+                                Test connection
+                            </button>
+                            <span class="settings-note" id="testLlmStatus"></span>
+                        </div>
+                        <div class="settings-note">
+                            NVIDIA NIM uses the OpenAI-compatible <code>/chat/completions</code> API and supports both text and image (screenshot) questions.
+                        </div>
+                    </div>
+
+                    <div id="llmFieldsNote" class="settings-note">
+                        Provider settings apply immediately and are also written back to <code>.env</code> so they persist across restarts.
                     </div>
                 </div>
             </div>

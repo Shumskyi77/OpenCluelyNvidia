@@ -72,8 +72,50 @@
         }
         .math {
             font-family: 'Cambria Math', 'STIX Two Math', 'Latin Modern Math', Georgia, serif;
-            white-space: nowrap;
         }
+        .math-inline {
+            white-space: nowrap;
+            font-size: 1.02em;
+        }
+        .math-display {
+            display: block;
+            text-align: center;
+            font-size: 1.15em;
+            margin: 0.7rem auto;
+            padding: 0.55rem 0.8rem;
+            background: rgba(255, 255, 255, 0.06);
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            border-radius: 0.5rem;
+            overflow-x: auto;
+            white-space: nowrap;
+            max-width: 100%;
+        }
+        .mfrac {
+            display: inline-block;
+            vertical-align: middle;
+            text-align: center;
+            margin: 0 0.15em;
+            font-size: 0.92em;
+        }
+        .mfrac .mnum { display: block; padding: 0 0.25em; }
+        .mfrac .mden { display: block; padding: 0 0.25em; border-top: 1px solid currentColor; }
+        .mbinom { font-size: 0.88em; }
+        .mparen { font-size: 1.6em; font-weight: 300; vertical-align: middle; }
+        .msqrt .mbody { border-top: 1px solid currentColor; padding: 0 0.1em; }
+        .msqrt .mroot { font-size: 0.7em; vertical-align: super; margin-right: 1px; }
+        .mop { font-size: 1.35em; }
+        .mlimits { display: inline-block; vertical-align: middle; text-align: center; margin: 0 0.15em; }
+        .mlimits .mupper, .mlimits .mlower { display: block; font-size: 0.68em; line-height: 1.2; }
+        .msup, .msub { font-size: 0.75em; }
+        .mbf { font-weight: 700; }
+        .mbb { font-weight: 700; font-style: normal; }
+        .mit, .mcal { font-style: italic; }
+        .mtext, .mrm, .mopname { font-style: normal; }
+        .mopname { margin-right: 0.25em; }
+        .mover { text-decoration: overline; }
+        .munder { text-decoration: underline; }
+        .mvec, .mhat, .mbar, .mdot, .mddot { position: relative; }
+        .mspace { display: inline-block; width: 0.6em; }
         .markdown-content sup, .markdown-content sub {
             font-size: 0.72em;
             line-height: 0;
@@ -568,6 +610,24 @@
                         hideLoadingState();
                     }
                 });
+
+                // Show the real failure reason (missing key, 401, network, …)
+                // in the overlay instead of leaving it stuck on "Analyzing".
+                if (window.electronAPI.onLlmError) {
+                    window.electronAPI.onLlmError(function() {
+                        let errData = null;
+                        if (arguments.length >= 2 && arguments[1] && typeof arguments[1] === 'object') {
+                            errData = arguments[1];
+                        } else if (arguments.length >= 1 && arguments[0] && typeof arguments[0] === 'object') {
+                            errData = arguments[0];
+                        }
+                        const msg = (errData && errData.error) || 'AI request failed';
+                        console.log('[LLM-RESPONSE] llm-error received:', msg);
+                        hideLoadingState();
+                        displayResponse({ response: '⚠️ ' + msg });
+                        setupScrolling();
+                    });
+                }
                 
                 console.log('[LLM-RESPONSE] IPC listeners set up successfully');
             } else {

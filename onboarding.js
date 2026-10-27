@@ -42,8 +42,12 @@
   // ── State ─────────────────────────────────────────────────────────
   const state = {
     step: 0,
+    llmProvider: 'nvidia', // 'nvidia' (default) | 'gemini'
     geminiKey: '',
     geminiConfigured: false, // a key already exists in .env from a prior run
+    nvidiaKey: '',
+    nvidiaModel: '',
+    nvidiaConfigured: false, // an NVIDIA key already exists in .env
     speechProvider: null, // 'whisper' | 'azure' | 'skip'
     azureKey: '',
     azureRegion: '',
@@ -135,7 +139,11 @@
       case 'welcome':
         return true;
       case 'apikey':
-        // A key already in .env is enough — don't force a re-entry.
+        // Either provider is enough — don't force a re-entry when a key
+        // already exists in .env.
+        if (state.llmProvider === 'nvidia') {
+          return !!state.nvidiaKey.trim() || state.nvidiaConfigured;
+        }
         return !!state.geminiKey.trim() || state.geminiConfigured;
       case 'speech':
         if (state.speechProvider === 'azure') {
@@ -158,12 +166,20 @@
   const geminiInput = $('#geminiKey');
   const toggleVis = $('#toggleVis');
   const keyStatus = $('#keyStatus');
+  const nvidiaInput = $('#nvidiaKey');
+  const nvidiaModelInput = $('#nvidiaModel');
+  const toggleNvidiaVis = $('#toggleNvidiaVis');
+  const nvidiaKeyStatus = $('#nvidiaKeyStatus');
+  const geminiKeyField = $('#geminiKeyField');
+  const nvidiaKeyField = $('#nvidiaKeyField');
+  const nvidiaModelField = $('#nvidiaModelField');
 
-  function setKeyStatus(state_, text) {
-    keyStatus.className = `status-pill ${state_}`;
-    keyStatus.style.display = 'inline-flex';
-    const icon = keyStatus.querySelector('i');
-    const txt = keyStatus.querySelector('.text');
+  function setPillStatus(pill, state_, text) {
+    if (!pill) return;
+    pill.className = `status-pill ${state_}`;
+    pill.style.display = 'inline-flex';
+    const icon = pill.querySelector('i');
+    const txt = pill.querySelector('.text');
     if (state_ === 'testing') {
       icon.className = 'fas fa-circle-notch fa-spin';
     } else if (state_ === 'success') {
@@ -174,6 +190,21 @@
       icon.className = 'fas fa-circle-info';
     }
     txt.textContent = text;
+  }
+
+  function setKeyStatus(state_, text) {
+    setPillStatus(keyStatus, state_, text);
+  }
+
+  function setNvidiaKeyStatus(state_, text) {
+    setPillStatus(nvidiaKeyStatus, state_, text);
+  }
+
+  function refreshLlmProviderFields() {
+    const isNvidia = state.llmProvider === 'nvidia';
+    if (geminiKeyField) geminiKeyField.style.display = isNvidia ? 'none' : '';
+    if (nvidiaKeyField) nvidiaKeyField.style.display = isNvidia ? '' : 'none';
+    if (nvidiaModelField) nvidiaModelField.style.display = isNvidia ? '' : 'none';
   }
 
   geminiInput.addEventListener('input', () => {
@@ -194,6 +225,44 @@
       ? '<i class="fas fa-eye"></i>'
       : '<i class="fas fa-eye-slash"></i>';
   });
+
+  // ── Wire up: AI provider choice ───────────────────────────────────
+  $$('#llmProviderChoices .choice-card').forEach((card) => {
+    card.addEventListener('click', () => {
+      const value = card.dataset.value;
+      state.llmProvider = value === 'nvidia' ? 'nvidia' : 'gemini';
+      $$('#llmProviderChoices .choice-card').forEach((c) => c.classList.remove('selected'));
+      card.classList.add('selected');
+      refreshLlmProviderFields();
+    });
+  });
+
+  if (nvidiaInput) {
+    nvidiaInput.addEventListener('input', () => {
+      state.nvidiaKey = nvidiaInput.value.trim();
+      if (!state.nvidiaKey) {
+        nvidiaKeyStatus.style.display = 'none';
+      } else if (!nvidiaKeyStatus.classList.contains('success')) {
+        setNvidiaKeyStatus('idle', 'Key entered');
+      }
+    });
+  }
+
+  if (nvidiaModelInput) {
+    nvidiaModelInput.addEventListener('input', () => {
+      state.nvidiaModel = nvidiaModelInput.value.trim();
+    });
+  }
+
+  if (toggleNvidiaVis && nvidiaInput) {
+    toggleNvidiaVis.addEventListener('click', () => {
+      const showing = nvidiaInput.type === 'text';
+      nvidiaInput.type = showing ? 'password' : 'text';
+      toggleNvidiaVis.innerHTML = showing
+        ? '<i class="fas fa-eye"></i>'
+        : '<i class="fas fa-eye-slash"></i>';
+    });
+  }
 
   // ── Wire up: Speech choices ───────────────────────────────────────
   $$('#speechChoices .choice-card').forEach((card) => {
@@ -450,11 +519,19 @@
   // ── Wire up: Finish screen ────────────────────────────────────────
   function populateSummary() {
     const rows = [];
-    rows.push({
-      label: '<i class="fas fa-key"></i> Gemini API',
-      value: (state.geminiKey || state.geminiConfigured) ? 'Configured' : 'Missing',
-      cls: (state.geminiKey || state.geminiConfigured) ? 'ok' : 'skip',
-    });
+    if (state.llmProvider === 'nvidia') {
+      rows.push({
+        label: '<i class="fas fa-microchip"></i> NVIDIA NIM',
+        value: (state.nvidiaKey || state.nvidiaConfigured) ? `Configured${state.nvidiaModel ? ` (${state.nvidiaModel})` : ''}` : 'Missing',
+        cls: (state.nvidiaKey || state.nvidiaConfigured) ? 'ok' : 'skip',
+      });
+    } else {
+      rows.push({
+        label: '<i class="fas fa-key"></i> Gemini API',
+        value: (state.geminiKey || state.geminiConfigured) ? 'Configured' : 'Missing',
+        cls: (state.geminiKey || state.geminiConfigured) ? 'ok' : 'skip',
+      });
+    }
     if (state.speechProvider === 'whisper') {
       rows.push({
         label: '<i class="fas fa-microphone"></i> Speech',
@@ -514,16 +591,28 @@
     const name = currentScreenName();
     if (!canAdvance()) {
       // Lightly nudge the user
-      if (name === 'apikey') setKeyStatus('error', 'Enter a Gemini API key');
+      if (name === 'apikey') {
+        if (state.llmProvider === 'nvidia') setNvidiaKeyStatus('error', 'Enter an NVIDIA API key');
+        else setKeyStatus('error', 'Enter a Gemini API key');
+      }
       return;
     }
 
-    // Persist settings on speech selection (Azure path), since we
-    // already saved geminiKey on test; do it here too if user skipped
-    // testing.
-    if (name === 'apikey' && state.geminiKey && window.electronAPI) {
+    // Persist settings on API-key selection. Save the provider explicitly so
+    // a re-entry or provider switch is recorded even when the key itself is
+    // unchanged (already configured from a prior run).
+    if (name === 'apikey' && window.electronAPI) {
       try {
-        await window.electronAPI.saveSettings({ geminiKey: state.geminiKey });
+        if (state.llmProvider === 'nvidia') {
+          const payload = { llmProvider: 'nvidia' };
+          if (state.nvidiaKey) payload.nvidiaKey = state.nvidiaKey;
+          if (state.nvidiaModel) payload.nvidiaModel = state.nvidiaModel;
+          await window.electronAPI.saveSettings(payload);
+        } else if (state.geminiKey) {
+          await window.electronAPI.saveSettings({ llmProvider: 'gemini', geminiKey: state.geminiKey });
+        } else {
+          await window.electronAPI.saveSettings({ llmProvider: 'gemini' });
+        }
       } catch (_) { /* surfaced elsewhere */ }
     }
     if (name === 'speech' && window.electronAPI) {
@@ -653,6 +742,7 @@
   };
 
   // ── Boot ──────────────────────────────────────────────────────────
+  refreshLlmProviderFields();
   showScreen('welcome');
 
   // Pre-populate Gemini key from existing .env (if any) so users with
@@ -666,6 +756,18 @@
         state.geminiConfigured = true;
         setKeyStatus('success', 'Already configured — click Continue');
         geminiInput.placeholder = '•••••••••••••••• (already set)';
+      }
+      if (s && s.nvidiaConfigured) {
+        state.nvidiaConfigured = true;
+        setNvidiaKeyStatus('success', 'Already configured — click Continue');
+        if (nvidiaInput) nvidiaInput.placeholder = '•••••••••••••••• (already set)';
+      }
+      if (s && s.llmProvider) {
+        state.llmProvider = s.llmProvider === 'gemini' ? 'gemini' : 'nvidia';
+        $$('#llmProviderChoices .choice-card').forEach((c) =>
+          c.classList.toggle('selected', c.dataset.value === state.llmProvider)
+        );
+        refreshLlmProviderFields();
       }
     }).catch(() => {});
   }

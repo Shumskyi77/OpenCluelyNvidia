@@ -39,9 +39,12 @@ class ConfigManager {
       },
 
       llm: {
+        // Active provider: 'nvidia' (default; NVIDIA NIM, OpenAI-compatible
+        // API) or 'gemini'. Overridden by the LLM_PROVIDER env var.
+        provider: 'nvidia',
         gemini: {
-          model: 'gemini-3.1-flash-lite',
-          fallbackModels: ['gemini-2.5-flash-lite', 'gemini-3.5-flash'],
+          model: 'gemini-3.5-flash-lite',
+          fallbackModels: ['gemini-3.5-flash', 'gemini-3.1-flash-lite', 'gemini-2.5-flash-lite'],
           maxRetries: 3,
           timeout: 30000,
           fallbackEnabled: true,
@@ -53,20 +56,34 @@ class ConfigManager {
             maxOutputTokens: 4096,
             thinkingConfig: { thinkingBudget: 0 }
           }
+        },
+        nvidia: {
+          baseUrl: 'https://integrate.api.nvidia.com/v1',
+          model: 'google/diffusiongemma-26b-a4b-it',
+          // Sampling proven by the vendor example for diffusion models.
+          temperature: 1,
+          topP: 0.95,
+          // Token budget for thinking models. Must cover the HIDDEN thinking
+          // plus the answer (they share one budget) — too small a value cuts
+          // answers off mid-sentence. Brevity itself is enforced by the
+          // system prompt (3-4 short sentences), not by this number.
+          thinkingMaxTokens: 4096,
+          maxRetries: 2,
+          timeout: 45000
         }
       },
 
       speech: {
         provider: 'azure',
         azure: {
-          language: 'en-US',
+          language: 'pl-PL',
           enableDictation: true,
           enableAudioLogging: false,
           outputFormat: 'detailed'
         },
         whisper: {
           model: 'small',
-          language: 'auto',
+          language: 'pl',
           // segmentMs is the legacy fixed-window size and now acts as the
           // hard upper bound for a single utterance when VAD is enabled.
           segmentMs: 4000,

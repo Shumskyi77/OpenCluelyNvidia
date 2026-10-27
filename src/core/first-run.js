@@ -25,14 +25,17 @@ class FirstRunManager {
 
   /**
    * Returns true if this looks like a fresh install — no .env, no
-   * sentinel file, or .env exists but has no Gemini key.
+   * sentinel file, or .env exists but has no AI provider key (Gemini or NVIDIA).
    */
   needsOnboarding() {
     if (!fs.existsSync(this.sentinelPath)) return true;
     if (!fs.existsSync(this.envPath)) return true;
     const content = this._readEnv();
     const gemini = (content.GEMINI_API_KEY || '').trim();
-    return !gemini || gemini === 'your_gemini_api_key_here';
+    const nvidia = (content.NVIDIA_API_KEY || '').trim();
+    const hasGemini = !!gemini && gemini !== 'your_gemini_api_key_here';
+    const hasNvidia = !!nvidia && nvidia !== 'your_nvidia_api_key_here';
+    return !(hasGemini || hasNvidia);
   }
 
   /**
@@ -80,10 +83,14 @@ class FirstRunManager {
   getStatus() {
     const env = this._readEnv();
     const gemini = (env.GEMINI_API_KEY || '').trim();
+    const nvidia = (env.NVIDIA_API_KEY || '').trim();
+    const provider = String(env.LLM_PROVIDER || 'nvidia').trim().toLowerCase();
     return {
       envExists: fs.existsSync(this.envPath),
       sentinelExists: fs.existsSync(this.sentinelPath),
       geminiConfigured: !!gemini && gemini !== 'your_gemini_api_key_here',
+      nvidiaConfigured: !!nvidia && nvidia !== 'your_nvidia_api_key_here',
+      llmProvider: provider === 'nvidia' ? 'nvidia' : 'gemini',
       azureConfigured: !!(env.AZURE_SPEECH_KEY || '').trim() && !!(env.AZURE_SPEECH_REGION || '').trim(),
       whisperConfigured: !!(env.WHISPER_COMMAND || '').trim(),
       needsOnboarding: this.needsOnboarding()
@@ -144,6 +151,12 @@ class FirstRunManager {
       '',
       'GEMINI_API_KEY=your_gemini_api_key_here',
       '',
+      '# AI provider: "nvidia" (default; NVIDIA NIM, OpenAI-compatible) or "gemini".',
+      'LLM_PROVIDER=nvidia',
+      'NVIDIA_API_KEY=your_nvidia_api_key_here',
+      'NVIDIA_BASE_URL=https://integrate.api.nvidia.com/v1',
+      'NVIDIA_MODEL=google/diffusiongemma-26b-a4b-it',
+      '',
       '# Speech provider: "whisper" (local) or "azure" (cloud).',
       '# WHISPER_COMMAND is auto-set to the project-local venv when you',
       '# install Whisper through the onboarding wizard, so no PATH change',
@@ -154,11 +167,13 @@ class FirstRunManager {
       '# weights in a stable app-data folder. Set an absolute path to override.',
       '# WHISPER_MODEL_DIR=',
       'WHISPER_MODEL=small',
-      'WHISPER_LANGUAGE=auto',
+      'WHISPER_LANGUAGE=pl',
       'WHISPER_DEVICE=auto',
       'WHISPER_PYTHON=',
       'WHISPER_CAPTURE_MODE=vad',
       'WHISPER_RESPONSE_TARGET=both',
+      'AUDIO_SOURCE=both',
+      'WHISPER_ENGINE=auto',
       'WHISPER_MANUAL_MAX_MS=90000',
       'WHISPER_GPU_IDLE_MS=60000',
       'WHISPER_SEGMENT_MS=4000',

@@ -320,6 +320,20 @@ class WhisperInstaller {
     }
     log('✓ openai-whisper installed');
 
+    // Step 3b: faster-whisper (CTranslate2 backend, 2-4x faster on CPU with
+    // the same accuracy). Best-effort: if it fails, the app still works with
+    // openai-whisper and the worker falls back to it automatically.
+    log(`→ Installing faster-whisper into venv (faster CPU transcription)…`);
+    const fwResult = await this.runExec(vp.python, ['-m', 'pip', 'install', '--upgrade', 'faster-whisper'], {
+      timeout: INSTALL_TIMEOUT_MS,
+      onProgress: log,
+    });
+    if (!fwResult.ok) {
+      log(`! faster-whisper install failed, continuing with openai-whisper: ${fwResult.stderr || fwResult.error}`);
+    } else {
+      log('✓ faster-whisper installed');
+    }
+
     // Step 4: verify the resulting CLI
     log(`→ Verifying whisper CLI at ${vp.whisper}…`);
     if (!fs.existsSync(vp.whisper)) {

@@ -425,6 +425,16 @@ class SpeechService extends EventEmitter {
     this.pendingFinal = false;
     this.audioProgram = null;
     this.whisperCommand = null;
+    // Mic + system-sound mixing (Linux native path; Windows/macOS mix in the
+    // renderer via Web Audio). Raw PCM queues per source, mixed on a timer.
+    this.mixerTimer = null;
+    this.mixerMicBuffers = [];
+    this.mixerMicBytes = 0;
+    this.mixerSysBuffers = [];
+    this.mixerSysBytes = 0;
+    this.monitorProcess = null;
+    this.lastDetectedLanguage = null;
+    this._lastLangWarnAt = 0;
     this.whisperWorker = new WhisperWorkerService();
     this.isProcessingAudio = false;
     this.manualStopRequested = false;
@@ -691,6 +701,7 @@ class SpeechService extends EventEmitter {
     if (this.whisperWorker.isConfigured()) {
       this.whisperWorker.warmup({
         model: this._getWhisperModel(),
+        engine: this._getWhisperEngine(),
         modelDir: this._getWhisperModelDir(),
         device: this._getWhisperDevice()
       }).then((result) => {
@@ -722,11 +733,267 @@ class SpeechService extends EventEmitter {
       return;
     }
 
-    this._startMicrophoneCapture();
+    // Linux native path: microphone and/or PulseAudio/PipeWire monitor,
+    // mixed together when system sound is enabled.
+    if (this._audioWantsMic()) {
+      this._startMicrophoneCapture();
+    }
+    if (this._audioWantsSystem()) {
+      this._startAudioMixer();
+      this._startSystemMonitorCapture();
+    }
     if (!this._isManualCaptureMode()) {
       this._startSegmentWatchdog();
     }
 
+  }
+
+  /** Audio source selection: 'mic' | 'system' | 'both' (default). */
+  _getAudioSource() {
+    const raw = String(
+      this._getSetting('audioSource') || process.env.AUDIO_SOURCE || 'both'
+    ).trim().toLowerCase();
+    if (raw === 'mic' || raw === 'system' || raw === 'both') {
+      return raw;
+    }
+    return 'both';
+  }
+
+  _audioWantsMic() {
+    return this._getAudioSource() !== 'system';
+  }
+
+  _audioWantsSystem() {
+    return this._getAudioSource() !== 'mic';
+  }
+
+  // ── Mic + system PCM mixer (Linux native path) ──
+
+  _mixerActive() {
+    return !!this.mixerTimer;
+  }
+
+  _startAudioMixer() {
+    this._stopAudioMixer();
+    this.mixerMicBuffers = [];
+    this.mixerMicBytes = 0;
+    this.mixerSysBuffers = [];
+    this.mixerSysBytes = 0;
+    // 120 ms ticks at 16 kHz mono s16le => 3840 bytes per tick.
+    this.mixerTimer = setInterval(() => this._mixerTick(), 120);
+  }
+
+  _stopAudioMixer() {
+    if (this.mixerTimer) {
+      clearInterval(this.mixerTimer);
+      this.mixerTimer = null;
+    }
+    this.mixerMicBuffers = [];
+    this.mixerMicBytes = 0;
+    this.mixerSysBuffers = [];
+    this.mixerSysBytes = 0;
+  }
+
+  _pushMixerQueue(which, buffer) {
+    if (!buffer || !buffer.length) {
+      return;
+    }
+    const buf = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer);
+    const isMic = which === 'mic';
+    const list = isMic ? this.mixerMicBuffers : this.mixerSysBuffers;
+    const key = isMic ? 'mixerMicBytes' : 'mixerSysBytes';
+    list.push(buf);
+    this[key] += buf.length;
+    // Bound memory if the consumer stalls (keep ~30 s max per source).
+    const MAX_BYTES = 16000 * 2 * 30;
+    while (this[key] > MAX_BYTES && list.length > 1) {
+      const dropped = list.shift();
+      this[key] -= dropped.length;
+    }
+  }
+
+  _takeQueueBytes(list, key, n) {
+    let out = Buffer.alloc(0);
+    while (out.length < n && list.length > 0) {
+      const head = list[0];
+      const need = n - out.length;
+      if (head.length <= need) {
+        out = Buffer.concat([out, head]);
+        list.shift();
+        this[key] -= head.length;
+      } else {
+        out = Buffer.concat([out, head.subarray(0, need)]);
+        list[0] = head.subarray(need);
+        this[key] -= need;
+      }
+    }
+    if (out.length < n) {
+      out = Buffer.concat([out, Buffer.alloc(n - out.length)]);
+    }
+    return out;
+  }
+
+  _mixerTick() {
+    if (!this.isRecording || this.provider !== 'whisper') {
+      return;
+    }
+    if (!this.mixerMicBytes && !this.mixerSysBytes) {
+      return;
+    }
+    const N = 3840;
+    const mic = this._takeQueueBytes(this.mixerMicBuffers, 'mixerMicBytes', N);
+    const sys = this._takeQueueBytes(this.mixerSysBuffers, 'mixerSysBytes', N);
+    const mixed = Buffer.alloc(N);
+    for (let i = 0; i < N; i += 2) {
+      const sample = mic.readInt16LE(i) + sys.readInt16LE(i);
+      mixed.writeInt16LE(Math.max(-32768, Math.min(32767, sample)), i);
+    }
+    this._ingestWhisperAudio(mixed);
+  }
+
+  // ── System-sound monitor (Linux native path) ──
+  // Windows/macOS capture loopback audio in the renderer via getDisplayMedia
+  // and mix it in Web Audio, so nothing is needed here for those platforms.
+
+  _startSystemMonitorCapture() {
+    if (process.platform !== 'linux') {
+      return;
+    }
+    if (this._audioProgramExists('parec')) {
+      this._startPulseMonitor();
+      return;
+    }
+    if (this._audioProgramExists('pw-record')) {
+      this._startPipeWireMonitor();
+      return;
+    }
+    logger.warn('No system-audio monitor available (need parec or pw-record); using microphone only');
+    this.emit('status', 'System sound unavailable (install PulseAudio or PipeWire). Using microphone only.');
+  }
+
+  _findPulseMonitorDevice() {
+    try {
+      const sink = spawnSync('pactl', ['get-default-sink'], {
+        encoding: 'utf8',
+        timeout: 4000,
+      });
+      const sinkName = (sink.stdout || '').trim();
+      const sources = spawnSync('pactl', ['list', 'short', 'sources'], {
+        encoding: 'utf8',
+        timeout: 4000,
+      });
+      const lines = (sources.stdout || '').split('\n');
+      if (sinkName) {
+        const exact = `${sinkName}.monitor`;
+        if (lines.some((l) => l.includes(exact))) {
+          return exact;
+        }
+      }
+      const anyMonitor = lines.find((l) => l.includes('.monitor'));
+      if (anyMonitor) {
+        const cols = anyMonitor.split('\t').filter(Boolean);
+        if (cols[1]) {
+          return cols[1].trim();
+        }
+      }
+    } catch (_) {
+      // fall through to null
+    }
+    return null;
+  }
+
+  _startPulseMonitor() {
+    const device = this._findPulseMonitorDevice();
+    if (!device) {
+      logger.warn('PulseAudio monitor source not found; using microphone only');
+      this.emit('status', 'System sound source not found. Using microphone only.');
+      return;
+    }
+    try {
+      const child = spawn(
+        'parec',
+        ['--format=s16le', '--rate=16000', '--channels=1', `--device=${device}`],
+        { stdio: ['ignore', 'pipe', 'pipe'] }
+      );
+      this.monitorProcess = child;
+      logger.info('PulseAudio system monitor started', { device });
+      this.emit('status', 'Listening to microphone and system sound…');
+      child.stdout.on('data', (chunk) => {
+        if (this.isRecording && this.provider === 'whisper') {
+          this._pushMixerQueue('sys', chunk);
+        }
+      });
+      child.stderr.on('data', () => { /* progress noise, ignore */ });
+      child.on('error', (error) => {
+        logger.error('System monitor process error', { error: error.message });
+        this._stopSystemMonitorCapture();
+      });
+      child.on('close', (code) => {
+        if (code !== 0 && this.isRecording) {
+          logger.warn('System monitor exited early; continuing with microphone only', { code });
+        }
+        if (this.monitorProcess === child) {
+          this.monitorProcess = null;
+        }
+      });
+    } catch (error) {
+      logger.error('Failed to start PulseAudio monitor', { error: error.message });
+      this.emit('status', 'Could not capture system sound. Using microphone only.');
+    }
+  }
+
+  _startPipeWireMonitor() {
+    try {
+      const child = spawn(
+        'pw-record',
+        ['--format=s16', '--rate=16000', '--channels=1', '-'],
+        { stdio: ['ignore', 'pipe', 'pipe'] }
+      );
+      this.monitorProcess = child;
+      logger.info('PipeWire system monitor started');
+      this.emit('status', 'Listening to microphone and system sound…');
+      let gotData = false;
+      child.stdout.on('data', (chunk) => {
+        gotData = true;
+        if (this.isRecording && this.provider === 'whisper') {
+          this._pushMixerQueue('sys', chunk);
+        }
+      });
+      child.stderr.on('data', () => { /* progress noise, ignore */ });
+      child.on('error', (error) => {
+        logger.error('System monitor process error', { error: error.message });
+        this._stopSystemMonitorCapture();
+      });
+      child.on('close', (code) => {
+        if (!gotData && code !== 0 && this.isRecording) {
+          // pw-record CLI differs across versions — fall back to parec.
+          logger.warn('PipeWire monitor failed; trying PulseAudio monitor', { code });
+          if (this.monitorProcess === child) {
+            this.monitorProcess = null;
+          }
+          if (this._audioProgramExists('parec')) {
+            this._startPulseMonitor();
+            return;
+          }
+          this.emit('status', 'Could not capture system sound. Using microphone only.');
+        }
+        if (this.monitorProcess === child) {
+          this.monitorProcess = null;
+        }
+      });
+    } catch (error) {
+      logger.error('Failed to start PipeWire monitor', { error: error.message });
+      this.emit('status', 'Could not capture system sound. Using microphone only.');
+    }
+  }
+
+  _stopSystemMonitorCapture() {
+    if (this.monitorProcess) {
+      try {
+        this.monitorProcess.kill('SIGTERM');
+      } catch (_) { /* already gone */ }
+      this.monitorProcess = null;
+    }
   }
 
   /**
@@ -1023,6 +1290,8 @@ class SpeechService extends EventEmitter {
   }
 
   _cleanup() {
+    this._stopAudioMixer();
+    this._stopSystemMonitorCapture();
     if (this.segmentTimer) {
       clearInterval(this.segmentTimer);
       this.segmentTimer = null;
@@ -1175,7 +1444,9 @@ class SpeechService extends EventEmitter {
         whisperLanguage: this._getWhisperLanguage(),
         whisperCaptureMode: this._getWhisperCaptureMode(),
         whisperDevice: this._getWhisperDevice(),
-        whisperSegmentMs: String(this._getWhisperSegmentMs())
+        whisperSegmentMs: String(this._getWhisperSegmentMs()),
+        audioSource: this._getAudioSource(),
+        whisperEngine: this._getWhisperEngine()
       },
       config: {
         azure: config.get('speech.azure') || {},
@@ -1209,7 +1480,7 @@ class SpeechService extends EventEmitter {
   }
 
   updateSettings(settings = {}) {
-    const speechKeys = ['speechProvider', 'azureKey', 'azureRegion', 'whisperCommand', 'whisperModelDir', 'whisperModel', 'whisperLanguage', 'whisperCaptureMode', 'whisperDevice', 'whisperSegmentMs'];
+    const speechKeys = ['speechProvider', 'azureKey', 'azureRegion', 'whisperCommand', 'whisperModelDir', 'whisperModel', 'whisperLanguage', 'whisperCaptureMode', 'whisperDevice', 'whisperSegmentMs', 'audioSource', 'whisperEngine'];
     let changed = false;
 
     for (const key of speechKeys) {
@@ -1272,8 +1543,39 @@ class SpeechService extends EventEmitter {
     }
   }
 
+  /**
+   * Polish initial prompt pins the decoder to Polish output even for short
+   * utterances where Whisper's own language detection is unreliable
+   * (otherwise Polish speech can come back as English-sounding gibberish).
+   */
+  _getWhisperInitialPrompt(language) {
+    const lang = String(language || this._getWhisperLanguage() || '').trim().toLowerCase();
+    if (lang === 'pl' || lang.startsWith('pl-')) {
+      return 'To jest transkrypcja mówiona w języku polskim.';
+    }
+    return null;
+  }
+
+  /** Transcription backend: 'auto' (prefer faster-whisper) | 'faster' | 'openai'. */
+  _getWhisperEngine() {
+    const raw = String(
+      this._getSetting('whisperEngine') || process.env.WHISPER_ENGINE || 'auto'
+    ).trim().toLowerCase();
+    if (raw === 'faster' || raw === 'openai' || raw === 'auto') {
+      return raw;
+    }
+    return 'auto';
+  }
+
   _getWhisperLanguage() {
-    return this._getSetting('whisperLanguage') || process.env.WHISPER_LANGUAGE || config.get('speech.whisper.language') || 'auto';
+    const raw = this._getSetting('whisperLanguage') || process.env.WHISPER_LANGUAGE || config.get('speech.whisper.language') || 'pl';
+    const lang = String(raw).trim().toLowerCase();
+    // Default to Polish: legacy configs stored 'auto' (auto-detect), which
+    // hurts accuracy for Polish speech. Explicit codes like 'en' still work.
+    if (!lang || lang === 'auto' || lang === 'detect') {
+      return 'pl';
+    }
+    return lang;
   }
 
   _getWhisperSegmentMs() {
@@ -1802,7 +2104,13 @@ class SpeechService extends EventEmitter {
     }
 
     if (this.provider === 'whisper') {
-      this._ingestWhisperAudio(Buffer.from(chunk));
+      // When system-sound capture is on, mic chunks go through the mixer
+      // so they are sample-mixed with the monitor stream before VAD.
+      if (this._mixerActive()) {
+        this._pushMixerQueue('mic', Buffer.from(chunk));
+      } else {
+        this._ingestWhisperAudio(Buffer.from(chunk));
+      }
     }
   }
 
@@ -1834,6 +2142,7 @@ class SpeechService extends EventEmitter {
       const transcript = await this._transcribeWhisperBuffer(audioBuffer);
       const clean = transcript ? transcript.trim() : '';
       if (clean && !this._isHallucinatedTranscript(clean)) {
+        this._warnOnLanguageMismatch();
         this.emit('transcription', clean);
       } else if (clean) {
         logger.debug('Dropped likely Whisper silence hallucination', { transcript: clean });
@@ -1856,6 +2165,37 @@ class SpeechService extends EventEmitter {
    * VAD already prevents most silent flushes; this is the final guard so these
    * phantom phrases never reach the chat or the LLM.
    */
+  /**
+   * Self-diagnosis: if Whisper detected a different base language than the
+   * configured one (e.g. 'en' instead of 'pl'), Polish speech comes back as
+   * English-sounding gibberish. Warn in the chat (max once a minute) so the
+   * user sees the cause instead of guessing. Never throws.
+   */
+  _warnOnLanguageMismatch() {
+    try {
+      const requested = String(this._getWhisperLanguage() || '').trim().toLowerCase();
+      const detected = String(this.lastDetectedLanguage || '').trim().toLowerCase();
+      if (!requested || !detected || requested === 'auto' || requested === 'detect') {
+        return;
+      }
+      if (detected.split('-')[0] === requested.split('-')[0]) {
+        return;
+      }
+      const now = Date.now();
+      if (now - (this._lastLangWarnAt || 0) < 60000) {
+        return;
+      }
+      this._lastLangWarnAt = now;
+      logger.warn('Whisper language mismatch: detected language differs from configured', {
+        requested,
+        detected
+      });
+      this.emit('status', `Whisper wykrył język "${detected}" zamiast "${requested}" — ustaw Settings → Speech → Whisper Language na "${requested}" i zrestartuj aplikację.`);
+    } catch (_) {
+      // Never break transcription because of diagnostics.
+    }
+  }
+
   _isHallucinatedTranscript(text) {
     const normalized = text.toLowerCase().replace(/[\s.,!?¡¿"'`]+/g, ' ').trim();
     if (!normalized) {
@@ -1875,7 +2215,19 @@ class SpeechService extends EventEmitter {
       'ok',
       'so',
       'the end',
-      'subtitles by the amara org community'
+      'subtitles by the amara org community',
+      // Polish equivalents of the same silence-hallucination artifacts
+      'dziękuję',
+      'dziękuję za oglądanie',
+      'dzięki za oglądanie',
+      'dziękuję bardzo za oglądanie',
+      'zasubskrybuj',
+      'proszę zasubskrybować',
+      'lajkuj i subskrybuj',
+      'do widzenia',
+      'pa pa',
+      'koniec',
+      'napisy stworzone przez społeczność amara'
     ]);
     return HALLUCINATIONS.has(normalized);
   }
@@ -1897,22 +2249,32 @@ class SpeechService extends EventEmitter {
       throw new Error('Local Whisper CLI not configured');
     }
 
+    // Reset per-file so a stale value from an earlier file can never
+    // trigger a false language-mismatch warning.
+    this.lastDetectedLanguage = null;
+
     if (this.whisperWorker.isConfigured()) {
       const startedAt = Date.now();
+      const requestedLanguage = this._getWhisperLanguage();
       try {
         const result = await this.whisperWorker.transcribe(audioFilePath, {
           model: this._getWhisperModel(),
-          language: this._getWhisperLanguage(),
+          language: requestedLanguage,
+          initialPrompt: this._getWhisperInitialPrompt(requestedLanguage),
+          engine: this._getWhisperEngine(),
           modelDir: this._getWhisperModelDir(),
           device: this._getWhisperDevice()
         });
         logger.info('Persistent Whisper transcription completed', {
           processingTime: Date.now() - startedAt,
           model: result.model,
+          engine: result.engine || this._getWhisperEngine(),
           device: result.device,
           gpu: result.gpu,
+          requestedLanguage,
           detectedLanguage: result.language
         });
+        this.lastDetectedLanguage = result.language || null;
         return result.text || '';
       } catch (error) {
         logger.warn('Persistent Whisper worker failed; falling back to CLI', {
@@ -1937,6 +2299,11 @@ class SpeechService extends EventEmitter {
     const language = this._getWhisperLanguage();
     if (language && language !== 'auto' && language !== 'detect') {
       args.push('--language', language);
+    }
+
+    const initialPrompt = this._getWhisperInitialPrompt(language);
+    if (initialPrompt) {
+      args.push('--initial_prompt', initialPrompt);
     }
 
     if (this._getWhisperModelDir()) {

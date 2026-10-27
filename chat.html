@@ -405,8 +405,49 @@
       }
       .message-text .math {
         font-family: 'Cambria Math', 'STIX Two Math', 'Latin Modern Math', Georgia, serif;
-        white-space: nowrap;
       }
+      .message-text .math-inline {
+        white-space: nowrap;
+        font-size: 1.02em;
+      }
+      .message-text .math-display {
+        display: block;
+        text-align: center;
+        font-size: 1.15em;
+        margin: 0.7rem auto;
+        padding: 0.55rem 0.8rem;
+        background: rgba(255, 255, 255, 0.06);
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 0.5rem;
+        overflow-x: auto;
+        white-space: nowrap;
+        max-width: 100%;
+      }
+      .message-text .mfrac {
+        display: inline-block;
+        vertical-align: middle;
+        text-align: center;
+        margin: 0 0.15em;
+        font-size: 0.92em;
+      }
+      .message-text .mfrac .mnum { display: block; padding: 0 0.25em; }
+      .message-text .mfrac .mden { display: block; padding: 0 0.25em; border-top: 1px solid currentColor; }
+      .message-text .mbinom { font-size: 0.88em; }
+      .message-text .mparen { font-size: 1.6em; font-weight: 300; vertical-align: middle; }
+      .message-text .msqrt .mbody { border-top: 1px solid currentColor; padding: 0 0.1em; }
+      .message-text .msqrt .mroot { font-size: 0.7em; vertical-align: super; margin-right: 1px; }
+      .message-text .mop { font-size: 1.35em; }
+      .message-text .mlimits { display: inline-block; vertical-align: middle; text-align: center; margin: 0 0.15em; }
+      .message-text .mlimits .mupper, .message-text .mlimits .mlower { display: block; font-size: 0.68em; line-height: 1.2; }
+      .message-text .msup, .message-text .msub { font-size: 0.75em; }
+      .message-text .mbf { font-weight: 700; }
+      .message-text .mbb { font-weight: 700; font-style: normal; }
+      .message-text .mit, .message-text .mcal { font-style: italic; }
+      .message-text .mtext, .message-text .mrm, .message-text .mopname { font-style: normal; }
+      .message-text .mopname { margin-right: 0.25em; }
+      .message-text .mover { text-decoration: overline; }
+      .message-text .munder { text-decoration: underline; }
+      .message-text .mspace { display: inline-block; width: 0.6em; }
       .message-text sup, .message-text sub {
         font-size: 0.72em;
         line-height: 0;
@@ -1208,6 +1249,17 @@
             renderAssistantResponse(data.response);
           }
         });
+
+        // Show the real failure reason (missing key, 401, network, …)
+        // next to the fallback answer instead of failing silently.
+        if (whysperAPI.onLlmError) {
+          whysperAPI.onLlmError((event, data) => {
+            try { hideThinkingIndicator(); } catch (_) {}
+            if (data && data.error) {
+              addMessage(data.error, 'error');
+            }
+          });
+        }
       }
 
       // UI Event Listeners

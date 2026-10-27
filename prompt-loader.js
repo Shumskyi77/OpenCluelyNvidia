@@ -6,8 +6,11 @@ class PromptLoader {
     this.prompts = new Map();
     this.promptsLoaded = false;
     this.skillPromptSent = new Set();
-    // Focus only on DSA
-    this.skillsRequiringProgrammingLanguage = ['dsa'];
+    // Universal assistant by default; 'dsa' kept for backward compatibility.
+    // The coding-language hint is soft for 'general' (only when code is asked)
+    // and strict for legacy 'dsa' sessions.
+    this.skillsRequiringProgrammingLanguage = ['general', 'dsa'];
+    this.defaultSkill = 'general';
   }
 
   /**
@@ -28,10 +31,9 @@ class PromptLoader {
       for (const file of files) {
         if (file.endsWith('.md')) {
           const skillName = path.basename(file, '.md');
-          if (skillName !== 'dsa') continue; // only keep DSA
           const filePath = path.join(promptsDir, file);
           const promptContent = fs.readFileSync(filePath, 'utf8');
-          
+
           this.prompts.set(skillName, promptContent);
         }
       }
@@ -57,6 +59,12 @@ class PromptLoader {
 
     const normalizedSkillName = this.normalizeSkillName(skillName);
     let promptContent = this.prompts.get(normalizedSkillName);
+
+    // Fall back to the universal prompt for legacy/unknown skill names
+    // (e.g. old sessions stored with 'dsa' or other interview-only skills).
+    if (!promptContent && normalizedSkillName !== this.defaultSkill) {
+      promptContent = this.prompts.get(this.defaultSkill);
+    }
     
     if (!promptContent) {
       return null;
@@ -88,6 +96,12 @@ class PromptLoader {
     let languageInjection = '';
     
     switch (skillName) {
+      case 'general':
+        languageInjection = `\n\n## CODE LANGUAGE HINT: ${languageUpper}
+- This is a UNIVERSAL assistant, not a coding-only bot. Do NOT force code into non-coding answers.
+- ONLY when the user asks for code (or the question clearly requires it), write code in ${languageTitle} with fences tagged \`\`\`${fenceTag}\`\`\`.
+- For math / theory / general questions, answer with explanation and LaTeX math ($...$ / $$...$$), no code.`;
+        break;
       case 'dsa':
         languageInjection = `\n\n## IMPLEMENTATION LANGUAGE: ${languageUpper}
 STRICT REQUIREMENTS:
@@ -318,46 +332,38 @@ STRICT REQUIREMENTS:
    */
   normalizeSkillName(skillName) {
     if (!skillName) return 'general';
-    
+
     // Convert to lowercase and handle common variations
     const normalized = skillName.toLowerCase().trim();
+
+    // Universal assistant aliases
+    const generalAliases = new Set([
+      'general', 'assistant', 'universal', 'general-assistant',
+      'all', 'any', 'default', 'help', 'helper'
+    ]);
+    if (generalAliases.has(normalized)) return 'general';
+
+    // Legacy interview-only skills map to the universal assistant when
+    // there is no dedicated prompt file for them.
+    const legacyToGeneral = new Set([
+      'behavioral', 'behavioral-interview', 'behavior', 'sales', 'selling',
+      'business-development', 'presentation', 'presentations', 'public-speaking',
+      'data-science', 'datascience', 'machine-learning', 'ml', 'programming',
+      'coding', 'software-development', 'development', 'devops', 'dev-ops',
+      'infrastructure', 'system-design', 'systems-design', 'architecture',
+      'distributed-systems', 'negotiation', 'negotiating', 'conflict-resolution'
+    ]);
+    if (legacyToGeneral.has(normalized)) return 'general';
     
-    // Map common variations to standard names
+    // Map common variations to standard names (legacy 'dsa' kept working)
     const skillMap = {
       'dsa': 'dsa',
       'data-structures': 'dsa',
       'algorithms': 'dsa',
-      'data-structures-algorithms': 'dsa',
-      'behavioral': 'behavioral',
-      'behavioral-interview': 'behavioral',
-      'behavior': 'behavioral',
-      'sales': 'sales',
-      'selling': 'sales',
-      'business-development': 'sales',
-      'presentation': 'presentation',
-      'presentations': 'presentation',
-      'public-speaking': 'presentation',
-      'data-science': 'data-science',
-      'datascience': 'data-science',
-      'machine-learning': 'data-science',
-      'ml': 'data-science',
-      'programming': 'programming',
-      'coding': 'programming',
-      'software-development': 'programming',
-      'development': 'programming',
-      'devops': 'devops',
-      'dev-ops': 'devops',
-      'infrastructure': 'devops',
-      'system-design': 'system-design',
-      'systems-design': 'system-design',
-      'architecture': 'system-design',
-      'distributed-systems': 'system-design',
-      'negotiation': 'negotiation',
-      'negotiating': 'negotiation',
-      'conflict-resolution': 'negotiation'
+      'data-structures-algorithms': 'dsa'
     };
 
-    return skillMap[normalized] || normalized;
+    return skillMap[normalized] || 'general';
   }
 
   /**
@@ -368,7 +374,10 @@ STRICT REQUIREMENTS:
     if (!this.promptsLoaded) {
       this.loadPrompts();
     }
-    return ['dsa'];
+    const skills = Array.from(this.prompts.keys());
+    // Universal assistant first, legacy skills after.
+    skills.sort((a, b) => (a === this.defaultSkill ? -1 : b === this.defaultSkill ? 1 : a.localeCompare(b)));
+    return skills.length ? skills : [this.defaultSkill];
   }
 
   /**

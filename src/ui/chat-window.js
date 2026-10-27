@@ -298,6 +298,7 @@ class ChatWindowUI {
                 
                 // Show a brief activation message with the skill title
                 const icons = {
+                    'general': '🎯',
                     'dsa': '🧠',
                     'behavioral': '💼', 
                     'sales': '💰',
